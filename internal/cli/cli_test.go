@@ -216,3 +216,40 @@ func TestBackupBlobHostAllowsExternalBookshelf(t *testing.T) {
 		t.Fatalf("with --blob-host: %d %q", code, errOut)
 	}
 }
+
+// A file URL on the server itself that redirects to another host is held to
+// the same --blob-host rule as a URL that names that host directly.
+func TestBackupFollowsRedirectsOnlyToAllowedHosts(t *testing.T) {
+	bucket := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("x"))
+	}))
+	t.Cleanup(bucket.Close)
+	var api *httptest.Server
+	api = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/organizations":
+			_, _ = w.Write([]byte(`{"acme":"u"}`))
+		case "/organizations/acme/cookbooks":
+			_, _ = w.Write([]byte(`{"nginx":{"versions":[{"version":"1.0.0"}]}}`))
+		case "/organizations/acme/cookbooks/nginx/1.0.0":
+			_, _ = w.Write([]byte(`{"all_files":[{"name":"recipes/default.rb","checksum":"9dd4e461268c8034f5c8564e155c67a6","url":"` + api.URL + `/bookshelf/x"}]}`))
+		case "/bookshelf/x":
+			http.Redirect(w, r, bucket.URL+"/x", http.StatusFound)
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	t.Cleanup(api.Close)
+	key := writeKey(t)
+	dir := t.TempDir()
+	bucketHost := strings.TrimPrefix(bucket.URL, "http://")
+
+	code, _, errOut := run("backup", "--server", api.URL, "--key", key, "-o", filepath.Join(dir, "a.csb"))
+	if code != 1 || !strings.Contains(errOut, bucketHost) {
+		t.Fatalf("without --blob-host: %d %q; want a refused redirect naming %s", code, errOut, bucketHost)
+	}
+	code, _, errOut = run("backup", "--server", api.URL, "--key", key, "--blob-host", bucketHost, "-o", filepath.Join(dir, "b.csb"))
+	if code != 0 {
+		t.Fatalf("with --blob-host: %d %q", code, errOut)
+	}
+}
