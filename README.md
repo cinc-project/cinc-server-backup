@@ -8,11 +8,12 @@ Design: [docs/specs/2026-11-11-cinc-server-backup-design.md](docs/specs/2026-11-
 
 ## Status
 
-Milestone 1 (format and API backup) is in progress. Restore is not built yet.
+Backup and restore over the API work. Restore needs an empty target; the host tier (password hashes, server-admins), merge modes and resume are still to come.
 
 | Command | What it does |
 |---|---|
 | `backup --server URL --user NAME --key PEM -o FILE` | Crawls the whole server over its API as a superuser and writes a `.csb` file (0600, written atomically) |
+| `restore FILE --server URL --key PEM` | Checks the backup's checksums, then restores it into an empty server over its API; clients and users keep their keys |
 | `inspect FILE` | Prints source, time window, per-collection counts and warnings |
 | `verify FILE` | Checks every member against the manifest's SHA-256 digests |
 | `version` | Prints the version |

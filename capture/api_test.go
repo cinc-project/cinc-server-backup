@@ -131,38 +131,6 @@ func TestBlobWithWrongContentFailsTheBackup(t *testing.T) {
 	}
 }
 
-const sumA, sumB = "0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210"
-
-func TestFileRefsReadsOnlyManifestFileLists(t *testing.T) {
-	refs, err := fileRefs([]byte(`{
-		"all_files":[{"name":"recipes/default.rb","checksum":"` + sumA + `","url":"u1"}],
-		"recipes":[{"name":"default.rb","checksum":"` + sumB + `","url":"u2"}],
-		"metadata":{"attributes":{"planted":{"checksum":"` + sumA + `","url":"http://169.254.169.254/"}}}
-	}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := map[string]string{}
-	for _, r := range refs {
-		got[r.checksum] = r.url
-	}
-	// A {"checksum","url"} object an uploader wrote into metadata is not a file.
-	if len(refs) != 2 || got[sumA] != "u1" || got[sumB] != "u2" {
-		t.Fatalf("refs = %+v", refs)
-	}
-	if _, err := fileRefs([]byte(`{`)); err == nil {
-		t.Fatal("bad manifest accepted")
-	}
-}
-
-func TestFileRefsRejectsMalformedChecksum(t *testing.T) {
-	for _, sum := range []string{"", "abc", "../../etc/passwd", strings.Repeat("g", 32)} {
-		if _, err := fileRefs([]byte(`{"all_files":[{"checksum":"` + sum + `","url":"u"}]}`)); err == nil {
-			t.Errorf("checksum %q accepted", sum)
-		}
-	}
-}
-
 // cookbookServer serves one cookbook version whose file URL is fileURL
 // (with SERVER replaced by the fake server's own URL).
 func cookbookServer(t *testing.T, fileURL string) *httptest.Server {

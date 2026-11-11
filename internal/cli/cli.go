@@ -19,6 +19,7 @@ import (
 
 	"github.com/cinc-project/cinc-server-backup/capture"
 	"github.com/cinc-project/cinc-server-backup/format"
+	"github.com/cinc-project/cinc-server-backup/restore"
 )
 
 // Version is the tool version, set at build time.
@@ -73,7 +74,7 @@ manifest of checksums lets you prove later that nothing changed.`,
 		SilenceErrors: true,
 	}
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError{err} })
-	root.AddCommand(newBackupCmd(), newInspectCmd(), newVerifyCmd(), newVersionCmd())
+	root.AddCommand(newBackupCmd(), newRestoreCmd(), newInspectCmd(), newVerifyCmd(), newVersionCmd())
 	return root
 }
 
@@ -150,22 +151,8 @@ func runBackup(cmd *cobra.Command, f backupFlags) error {
 	if _, err := os.Stat(f.output); err == nil {
 		return fmt.Errorf("%s already exists, and we won't overwrite a backup; choose another -o path or move the old file", f.output)
 	}
-	pem, err := os.ReadFile(f.key)
-	if err != nil {
-		return fmt.Errorf("we couldn't read the key: %w", err)
-	}
-	key, err := cinc.ParseKey(pem)
-	if err != nil {
-		return fmt.Errorf("%s isn't a private key we can use: %w", f.key, err)
-	}
 	opts := capture.Options{Concurrency: f.concurrency, BlobHosts: f.blobHosts}
-	// cinc-api follows redirects for cookbook file transfers only; hold every
-	// hop to the same host rules as the manifest's own URL.
-	hc := &http.Client{Timeout: 30 * time.Second, CheckRedirect: capture.RedirectPolicy(f.server, opts)}
-	// Config.Org is required by the client but unused: the crawler sends
-	// absolute paths.
-	c, err := cinc.NewClient(cinc.Config{ServerURL: f.server, Org: "_", ClientName: f.user, Key: key},
-		cinc.WithUserAgent(progName+"/"+Version), cinc.WithHTTPClient(hc))
+	c, err := newClient(f.server, f.user, f.key, opts.BlobHosts)
 	if err != nil {
 		return err
 	}
@@ -204,6 +191,116 @@ func runBackup(cmd *cobra.Command, f backupFlags) error {
 	ok = true
 	fmt.Fprintf(cmd.OutOrStdout(), "Wrote %s\n", f.output)
 	return nil
+}
+
+// newClient builds a client signing as user with the key at keyPath. File
+// transfers may follow redirects only to the server's host or blobHosts.
+func newClient(server, user, keyPath string, blobHosts []string) (*cinc.Client, error) {
+	pem, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("we couldn't read the key: %w", err)
+	}
+	key, err := cinc.ParseKey(pem)
+	if err != nil {
+		return nil, fmt.Errorf("%s isn't a private key we can use: %w", keyPath, err)
+	}
+	// cinc-api follows redirects for file transfers only; hold every hop to
+	// the same host rules as the URL the server gave.
+	policy := capture.RedirectPolicy(server, capture.Options{BlobHosts: blobHosts})
+	hc := &http.Client{Timeout: 30 * time.Second, CheckRedirect: policy}
+	// Config.Org is required by the client but unused: every request is
+	// sent with an absolute path.
+	return cinc.NewClient(cinc.Config{ServerURL: server, Org: "_", ClientName: user, Key: key},
+		cinc.WithUserAgent(progName+"/"+Version), cinc.WithHTTPClient(hc))
+}
+
+type restoreFlags struct {
+	server, user, key string
+	concurrency       int
+	blobHosts         []string
+}
+
+func newRestoreCmd() *cobra.Command {
+	var f restoreFlags
+	cmd := &cobra.Command{
+		Use:   "restore <file.csb> --server <url> --key <pem>",
+		Short: "Restore a backup into a server over its API",
+		Long: `Restore a backup into a Cinc Server, Chef Infra Server or cinc-server-ng,
+signing every request as a superuser (pivotal, unless you say otherwise with
+--user). That superuser is left as the target has it.
+
+The target must not already have any of the backup's organizations or users:
+restore creates, it does not merge. We check the whole backup against its
+checksums before sending anything, then write users and their keys, orgs and
+members, clients and their keys, groups, every object, cookbook and policy,
+and finally the ACLs.
+
+Clients and users keep their public keys, so existing client.pem and
+validation.pem files work against the new server. Passwords can't be carried
+over the API: restored users get a random one until they reset it.`,
+		Example: `Restore a backup into a new, empty server.
+cinc-server-backup restore chef.csb --server https://new-chef.example.com --key pivotal.pem`,
+		Args: exactlyOneBackup,
+		RunE: func(cmd *cobra.Command, args []string) error { return runRestore(cmd, args[0], f) },
+	}
+	fl := cmd.Flags()
+	fl.StringVar(&f.server, "server", "", "URL of the server to restore into (required)")
+	fl.StringVar(&f.user, "user", "pivotal", "superuser to sign requests as")
+	fl.StringVar(&f.key, "key", "", "path to that superuser's private key (required)")
+	fl.IntVar(&f.concurrency, "concurrency", 8, "most requests to have in flight at once")
+	fl.StringArrayVar(&f.blobHosts, "blob-host", nil, "extra host[:port] file uploads may be redirected to, such as an S3 bookshelf (repeatable)")
+	return cmd
+}
+
+func runRestore(cmd *cobra.Command, file string, f restoreFlags) error {
+	var missing []string
+	for _, req := range []struct{ name, val string }{{"--server", f.server}, {"--key", f.key}} {
+		if req.val == "" {
+			missing = append(missing, req.name)
+		}
+	}
+	if len(missing) > 0 {
+		return usagef("restore needs %s", strings.Join(missing, ", "))
+	}
+	r, fh, err := format.Open(file)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fh.Close() }() // read-only
+	if err := r.Verify(); err != nil {
+		return fmt.Errorf("the backup failed its checksum check, so we won't restore it: %w", err)
+	}
+	c, err := newClient(f.server, f.user, f.key, f.blobHosts)
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
+	defer stop()
+	rep, err := restore.ToAPI(ctx, r, c, restore.Options{Concurrency: f.concurrency})
+	if rep != nil {
+		printReport(cmd.OutOrStdout(), rep)
+	}
+	return err
+}
+
+func printReport(out io.Writer, rep *restore.Report) {
+	tw := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+	keys := make([]string, 0, len(rep.Restored))
+	for k := range rep.Restored {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	fmt.Fprintln(tw, "restored")
+	for _, k := range keys {
+		fmt.Fprintf(tw, "  %s\t%d\n", k, rep.Restored[k])
+	}
+	if len(rep.Warnings) > 0 {
+		fmt.Fprintf(tw, "\nleft out (%d)\n", len(rep.Warnings))
+		for _, w := range rep.Warnings {
+			fmt.Fprintf(tw, "  %s\t%s\t%s\n", w.Code, w.Path, w.Detail)
+		}
+	}
+	_ = tw.Flush()
 }
 
 func newVerifyCmd() *cobra.Command {

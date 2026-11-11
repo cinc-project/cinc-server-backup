@@ -3,7 +3,6 @@ package capture
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -353,19 +352,19 @@ func (cr *crawler) manifests(ctx context.Context, o, coll, key, query string) er
 
 // files fetches every file a manifest references that no one has claimed yet.
 func (cr *crawler) files(ctx context.Context, manifest []byte) error {
-	refs, err := fileRefs(manifest)
+	refs, err := format.ManifestFiles(manifest)
 	if err != nil {
 		return err
 	}
 	for _, f := range refs {
-		if err := cr.checkBlobURL(f.url); err != nil {
+		if err := cr.checkBlobURL(f.URL); err != nil {
 			return err
 		}
-		if _, claimed := cr.blobs.LoadOrStore(f.checksum, struct{}{}); claimed {
+		if _, claimed := cr.blobs.LoadOrStore(f.Checksum, struct{}{}); claimed {
 			continue
 		}
 		cr.spawn(ctx, func(ctx context.Context) error {
-			return cr.c.Fetch(ctx, f.url, func(r io.Reader) error { return cr.w.PutBlob(f.checksum, r) })
+			return cr.c.Fetch(ctx, f.URL, func(r io.Reader) error { return cr.w.PutBlob(f.Checksum, r) })
 		})
 	}
 	return nil
@@ -419,52 +418,6 @@ func RedirectPolicy(serverURL string, opts Options) func(*http.Request, []*http.
 		}
 		return hs.check(req.URL)
 	}
-}
-
-type fileRef struct{ checksum, url string }
-
-// fileLists are the manifest members that list a cookbook's files: all_files
-// (API v2) and the per-segment lists of v0/v1. Nothing else in a manifest is
-// read for files, because metadata holds whatever the uploader wrote.
-var fileLists = []string{"all_files", "recipes", "definitions", "libraries", "attributes", "files", "templates", "resources", "providers", "root_files"}
-
-// fileRefs returns the files a cookbook or artifact manifest lists. A
-// checksum that is not 32 hex digits is an error.
-func fileRefs(manifest []byte) ([]fileRef, error) {
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(manifest, &doc); err != nil {
-		return nil, fmt.Errorf("decode manifest: %w", err)
-	}
-	var out []fileRef
-	for _, list := range fileLists {
-		raw, ok := doc[list]
-		if !ok {
-			continue
-		}
-		var files []struct {
-			Checksum string `json:"checksum"`
-			URL      string `json:"url"`
-		}
-		if err := json.Unmarshal(raw, &files); err != nil {
-			return nil, fmt.Errorf("decode manifest %s: %w", list, err)
-		}
-		for _, f := range files {
-			sum := strings.ToLower(f.Checksum)
-			if !isMD5(sum) {
-				return nil, fmt.Errorf("manifest %s lists a file with checksum %q, not an MD5", list, f.Checksum)
-			}
-			out = append(out, fileRef{sum, f.URL})
-		}
-	}
-	return out, nil
-}
-
-func isMD5(s string) bool {
-	if len(s) != 32 {
-		return false
-	}
-	_, err := hex.DecodeString(s)
-	return err == nil
 }
 
 func (cr *crawler) policies(ctx context.Context, o string) error {
