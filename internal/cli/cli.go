@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"text/tabwriter"
 
 	cinc "github.com/cinc-project/cinc-api"
@@ -71,6 +72,8 @@ func backup(args []string, stdout, stderr io.Writer) error {
 	keyPath := fs.String("key", "", "path to the superuser's private key")
 	out := fs.String("o", "", "backup file to write")
 	conc := fs.Int("concurrency", 8, "maximum requests in flight")
+	var blobHosts stringList
+	fs.Var(&blobHosts, "blob-host", "extra host[:port] cookbook files may be fetched from, e.g. an S3 bookshelf (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("%w: %v", errUsage, err)
 	}
@@ -114,7 +117,7 @@ func backup(args []string, stdout, stderr io.Writer) error {
 	}()
 	w := format.NewWriter(f, format.Source{URL: *server})
 	w.SetTool("cinc-server-backup " + Version)
-	if err := capture.FromAPI(ctx, c, w, capture.Options{Concurrency: *conc}); err != nil {
+	if err := capture.FromAPI(ctx, c, w, capture.Options{Concurrency: *conc, BlobHosts: blobHosts}); err != nil {
 		return err
 	}
 	if err := w.Close(); err != nil {
@@ -187,3 +190,9 @@ func inspect(args []string, stdout io.Writer) error {
 	}
 	return tw.Flush()
 }
+
+// stringList is a repeatable string flag.
+type stringList []string
+
+func (l *stringList) String() string     { return strings.Join(*l, ",") }
+func (l *stringList) Set(v string) error { *l = append(*l, v); return nil }

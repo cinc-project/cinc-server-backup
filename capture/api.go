@@ -3,12 +3,14 @@ package capture
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"sort"
+	"strings"
 	"sync"
 
 	cinc "github.com/cinc-project/cinc-api"
@@ -28,6 +30,11 @@ const (
 type Options struct {
 	// Concurrency bounds the requests in flight. Zero means 8.
 	Concurrency int
+	// BlobHosts lists extra hosts (host or host:port) cookbook files may be
+	// fetched from, such as the S3 endpoint of an external bookshelf. Files
+	// on the server's own host are always allowed; any other URL in a
+	// manifest is refused.
+	BlobHosts []string
 }
 
 // FromAPI crawls the whole server through c and writes every object it finds
@@ -41,7 +48,13 @@ func FromAPI(ctx context.Context, c *cinc.Client, w *format.Writer, opts Options
 	}
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	cr := &crawler{c: c, w: w, sem: make(chan struct{}, n), cancel: cancel}
+	cr := &crawler{c: c, w: w, sem: make(chan struct{}, n), cancel: cancel, blobHosts: map[string]bool{}}
+	if u, err := url.Parse(c.ServerURL()); err == nil {
+		cr.blobHosts[strings.ToLower(u.Host)] = true
+	}
+	for _, h := range opts.BlobHosts {
+		cr.blobHosts[strings.ToLower(h)] = true
+	}
 	cr.spawn(ctx, cr.users)
 	cr.spawn(ctx, cr.orgs)
 	cr.wg.Wait()
@@ -58,6 +71,8 @@ type crawler struct {
 	wg     sync.WaitGroup
 	cancel context.CancelCauseFunc
 	blobs  sync.Map // md5 -> struct{}: claimed by one fetcher
+	// blobHosts are the hosts cookbook files may be fetched from.
+	blobHosts map[string]bool
 }
 
 // spawn runs fn in its own goroutine once a slot is free. The first error
@@ -348,6 +363,9 @@ func (cr *crawler) files(ctx context.Context, manifest []byte) error {
 		return err
 	}
 	for _, f := range refs {
+		if err := cr.checkBlobURL(f.url); err != nil {
+			return err
+		}
 		if _, claimed := cr.blobs.LoadOrStore(f.checksum, struct{}{}); claimed {
 			continue
 		}
@@ -358,37 +376,67 @@ func (cr *crawler) files(ctx context.Context, manifest []byte) error {
 	return nil
 }
 
+// checkBlobURL refuses a file URL that is not http(s) on an allowed host.
+// The URL comes from the server, but a manifest is stored as uploaded, so it
+// must never be able to point the backup at an arbitrary address.
+func (cr *crawler) checkBlobURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("refusing to fetch cookbook file: bad URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("refusing to fetch cookbook file over %q: only http and https are allowed", u.Scheme)
+	}
+	if !cr.blobHosts[strings.ToLower(u.Host)] {
+		return fmt.Errorf("refusing to fetch cookbook file from host %s: not the server's host; allow an external bookshelf with --blob-host %s", u.Host, u.Host)
+	}
+	return nil
+}
+
 type fileRef struct{ checksum, url string }
 
-// fileRefs finds every {"checksum": ..., "url": ...} object in a manifest,
-// whichever API version's shape it has (all_files, or per-segment lists).
+// fileLists are the manifest members that list a cookbook's files: all_files
+// (API v2) and the per-segment lists of v0/v1. Nothing else in a manifest is
+// read for files, because metadata holds whatever the uploader wrote.
+var fileLists = []string{"all_files", "recipes", "definitions", "libraries", "attributes", "files", "templates", "resources", "providers", "root_files"}
+
+// fileRefs returns the files a cookbook or artifact manifest lists. A
+// checksum that is not 32 hex digits is an error.
 func fileRefs(manifest []byte) ([]fileRef, error) {
-	var doc any
+	var doc map[string]json.RawMessage
 	if err := json.Unmarshal(manifest, &doc); err != nil {
 		return nil, fmt.Errorf("decode manifest: %w", err)
 	}
 	var out []fileRef
-	var walk func(any)
-	walk = func(v any) {
-		switch t := v.(type) {
-		case map[string]any:
-			sum, ok1 := t["checksum"].(string)
-			u, ok2 := t["url"].(string)
-			if ok1 && ok2 {
-				out = append(out, fileRef{sum, u})
-				return
+	for _, list := range fileLists {
+		raw, ok := doc[list]
+		if !ok {
+			continue
+		}
+		var files []struct {
+			Checksum string `json:"checksum"`
+			URL      string `json:"url"`
+		}
+		if err := json.Unmarshal(raw, &files); err != nil {
+			return nil, fmt.Errorf("decode manifest %s: %w", list, err)
+		}
+		for _, f := range files {
+			sum := strings.ToLower(f.Checksum)
+			if !isMD5(sum) {
+				return nil, fmt.Errorf("manifest %s lists a file with checksum %q, not an MD5", list, f.Checksum)
 			}
-			for _, c := range t {
-				walk(c)
-			}
-		case []any:
-			for _, c := range t {
-				walk(c)
-			}
+			out = append(out, fileRef{sum, f.URL})
 		}
 	}
-	walk(doc)
 	return out, nil
+}
+
+func isMD5(s string) bool {
+	if len(s) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
 }
 
 func (cr *crawler) policies(ctx context.Context, o string) error {

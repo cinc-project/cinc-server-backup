@@ -182,3 +182,37 @@ func TestBackupRequiresServerKeyAndOutput(t *testing.T) {
 		t.Fatalf("backup = %d, err %q", code, errOut)
 	}
 }
+
+// A server whose one cookbook file lives on a second host, as with an
+// external (S3) bookshelf: backup refuses it unless --blob-host allows it.
+func TestBackupBlobHostAllowsExternalBookshelf(t *testing.T) {
+	bucket := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("x"))
+	}))
+	t.Cleanup(bucket.Close)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/organizations":
+			_, _ = w.Write([]byte(`{"acme":"u"}`))
+		case "/organizations/acme/cookbooks":
+			_, _ = w.Write([]byte(`{"nginx":{"versions":[{"version":"1.0.0"}]}}`))
+		case "/organizations/acme/cookbooks/nginx/1.0.0":
+			_, _ = w.Write([]byte(`{"all_files":[{"name":"recipes/default.rb","checksum":"9dd4e461268c8034f5c8564e155c67a6","url":"` + bucket.URL + `/x"}]}`))
+		default:
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	t.Cleanup(api.Close)
+	key := writeKey(t)
+	dir := t.TempDir()
+	bucketHost := strings.TrimPrefix(bucket.URL, "http://")
+
+	code, _, errOut := run("backup", "--server", api.URL, "--key", key, "-o", filepath.Join(dir, "a.csb"))
+	if code != 1 || !strings.Contains(errOut, bucketHost) {
+		t.Fatalf("without --blob-host: %d %q; want a refusal naming %s", code, errOut, bucketHost)
+	}
+	code, _, errOut = run("backup", "--server", api.URL, "--key", key, "--blob-host", bucketHost, "-o", filepath.Join(dir, "b.csb"))
+	if code != 0 {
+		t.Fatalf("with --blob-host: %d %q", code, errOut)
+	}
+}

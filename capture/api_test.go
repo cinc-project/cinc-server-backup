@@ -3,8 +3,10 @@ package capture
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -129,11 +131,13 @@ func TestBlobWithWrongContentFailsTheBackup(t *testing.T) {
 	}
 }
 
-func TestFileRefsFindsEveryManifestShape(t *testing.T) {
+const sumA, sumB = "0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210"
+
+func TestFileRefsReadsOnlyManifestFileLists(t *testing.T) {
 	refs, err := fileRefs([]byte(`{
-		"all_files":[{"checksum":"a","url":"u1"}],
-		"recipes":[{"checksum":"b","url":"u2"}],
-		"metadata":{"checksum":"not-a-file"}
+		"all_files":[{"name":"recipes/default.rb","checksum":"` + sumA + `","url":"u1"}],
+		"recipes":[{"name":"default.rb","checksum":"` + sumB + `","url":"u2"}],
+		"metadata":{"attributes":{"planted":{"checksum":"` + sumA + `","url":"http://169.254.169.254/"}}}
 	}`))
 	if err != nil {
 		t.Fatal(err)
@@ -142,10 +146,87 @@ func TestFileRefsFindsEveryManifestShape(t *testing.T) {
 	for _, r := range refs {
 		got[r.checksum] = r.url
 	}
-	if len(got) != 2 || got["a"] != "u1" || got["b"] != "u2" {
+	// A {"checksum","url"} object an uploader wrote into metadata is not a file.
+	if len(refs) != 2 || got[sumA] != "u1" || got[sumB] != "u2" {
 		t.Fatalf("refs = %+v", refs)
 	}
 	if _, err := fileRefs([]byte(`{`)); err == nil {
 		t.Fatal("bad manifest accepted")
+	}
+}
+
+func TestFileRefsRejectsMalformedChecksum(t *testing.T) {
+	for _, sum := range []string{"", "abc", "../../etc/passwd", strings.Repeat("g", 32)} {
+		if _, err := fileRefs([]byte(`{"all_files":[{"checksum":"` + sum + `","url":"u"}]}`)); err == nil {
+			t.Errorf("checksum %q accepted", sum)
+		}
+	}
+}
+
+// cookbookServer serves one cookbook version whose file URL is fileURL
+// (with SERVER replaced by the fake server's own URL).
+func cookbookServer(t *testing.T, fileURL string) *httptest.Server {
+	t.Helper()
+	routes := map[string]route{
+		"/organizations": {body: `{"acme":"u"}`},
+		"/organizations/acme/cookbooks?num_versions=all": {body: `{"nginx":{"versions":[{"version":"1.0.0"}]}}`},
+		"/bookshelf/x": {body: "x"},
+	}
+	srv := fakeServer(t, routes)
+	routes["/organizations/acme/cookbooks/nginx/1.0.0"] = route{body: `{"all_files":[{"name":"recipes/default.rb","checksum":"` +
+		md5hex("x") + `","url":"` + strings.ReplaceAll(fileURL, "SERVER", srv.URL) + `"}]}`}
+	return srv
+}
+
+func md5hex(s string) string {
+	sum := md5.Sum([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+func TestFileOnServerHostIsFetched(t *testing.T) {
+	srv := cookbookServer(t, "SERVER/bookshelf/x")
+	var buf bytes.Buffer
+	w := format.NewWriter(&buf, format.Source{})
+	if err := FromAPI(context.Background(), newClient(t, srv.URL), w, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if !w.HasBlob(md5hex("x")) {
+		t.Fatal("blob not stored")
+	}
+}
+
+func TestFileOnAnotherHostIsRefusedUnlessAllowed(t *testing.T) {
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("x"))
+	}))
+	t.Cleanup(other.Close)
+	otherHost := strings.TrimPrefix(other.URL, "http://")
+
+	srv := cookbookServer(t, other.URL+"/bucket/x")
+	var buf bytes.Buffer
+	err := FromAPI(context.Background(), newClient(t, srv.URL), format.NewWriter(&buf, format.Source{}), Options{})
+	if err == nil || !strings.Contains(err.Error(), otherHost) {
+		t.Fatalf("err = %v, want a refusal naming %s", err, otherHost)
+	}
+
+	// An operator can allow an external bookshelf (S3) host.
+	buf.Reset()
+	w := format.NewWriter(&buf, format.Source{})
+	if err := FromAPI(context.Background(), newClient(t, srv.URL), w, Options{BlobHosts: []string{otherHost}}); err != nil {
+		t.Fatalf("with BlobHosts: %v", err)
+	}
+	if !w.HasBlob(md5hex("x")) {
+		t.Fatal("blob from allowed host not stored")
+	}
+}
+
+func TestFileURLWithOtherSchemeIsRefused(t *testing.T) {
+	for _, u := range []string{"file:///etc/passwd", "gopher://SERVER/x"} {
+		srv := cookbookServer(t, u)
+		var buf bytes.Buffer
+		err := FromAPI(context.Background(), newClient(t, srv.URL), format.NewWriter(&buf, format.Source{}), Options{})
+		if err == nil || !strings.Contains(err.Error(), "refusing") {
+			t.Errorf("%s: err = %v, want a refusal", u, err)
+		}
 	}
 }
