@@ -15,6 +15,9 @@ Milestone 1 (format and API backup) is in progress. Restore is not built yet.
 | `backup --server URL --user NAME --key PEM -o FILE` | Crawls the whole server over its API as a superuser and writes a `.csb` file (0600, written atomically) |
 | `inspect FILE` | Prints source, time window, per-collection counts and warnings |
 | `verify FILE` | Checks every member against the manifest's SHA-256 digests |
+| `version` | Prints the version |
+
+Every command has `--help` with a description and examples, and `completion` prints shell completion scripts.
 
 ## Development
 

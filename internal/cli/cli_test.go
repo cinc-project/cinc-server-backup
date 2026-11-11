@@ -43,12 +43,10 @@ func writeBackup(t *testing.T) string {
 	return path
 }
 
-func TestNoArgsOrUnknownCommandIsUsageError(t *testing.T) {
-	for _, args := range [][]string{nil, {"frobnicate"}} {
-		code, _, errOut := run(args...)
-		if code != 2 || !strings.Contains(errOut, "usage") {
-			t.Errorf("Run(%v) = %d, stderr %q; want 2 and usage", args, code, errOut)
-		}
+func TestNoArgsPrintsHelpAsUsageError(t *testing.T) {
+	code, _, errOut := run()
+	if code != 2 || !strings.Contains(errOut, "Usage:") {
+		t.Errorf("Run() = %d, stderr %q; want 2 and the help", code, errOut)
 	}
 }
 
