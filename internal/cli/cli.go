@@ -4,7 +4,6 @@ package cli
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	cinc "github.com/cinc-project/cinc-api"
+	"github.com/spf13/cobra"
 
 	"github.com/cinc-project/cinc-server-backup/capture"
 	"github.com/cinc-project/cinc-server-backup/format"
@@ -24,154 +24,235 @@ import (
 // Version is the tool version, set at build time.
 var Version = "dev"
 
-const usage = `usage: cinc-server-backup <command> [flags]
+const progName = "cinc-server-backup"
 
-commands:
-  backup   take a backup of a server over its API
-  inspect  print what a backup contains
-  verify   check a backup's integrity
-`
+// usageError marks a command-line mistake (exit 2) rather than a failure
+// (exit 1).
+type usageError struct{ error }
 
-// errUsage marks a command-line mistake (exit 2) rather than a failure (exit 1).
-var errUsage = errors.New("usage")
+func usagef(format string, a ...any) error { return usageError{fmt.Errorf(format, a...)} }
 
 // Run executes the command line args (without the program name) and returns
 // the process exit code: 0 success, 1 failure, 2 usage error.
 func Run(args []string, stdout, stderr io.Writer) int {
+	root := newRootCmd()
+	root.SetArgs(args)
+	root.SetOut(stdout)
+	root.SetErr(stderr)
 	if len(args) == 0 {
-		_, _ = fmt.Fprint(stderr, usage)
+		root.SetOut(stderr)
+		_ = root.Help()
 		return 2
 	}
-	var err error
-	switch args[0] {
-	case "backup":
-		err = backup(args[1:], stdout, stderr)
-	case "inspect":
-		err = inspect(args[1:], stdout)
-	case "verify":
-		err = verify(args[1:], stdout)
-	default:
-		_, _ = fmt.Fprint(stderr, usage)
-		return 2
-	}
-	switch {
-	case err == nil:
+	cmd, err := root.ExecuteContextC(context.Background())
+	if err == nil {
 		return 0
-	case errors.Is(err, errUsage):
-		fmt.Fprintln(stderr, err)
+	}
+	var ue usageError
+	if errors.As(err, &ue) || strings.HasPrefix(err.Error(), "unknown command") {
+		fmt.Fprintf(stderr, "Error: %v\nRun '%s --help' to see how to use it.\n", err, cmd.CommandPath())
 		return 2
-	default:
-		fmt.Fprintln(stderr, "error:", err)
-		return 1
+	}
+	fmt.Fprintln(stderr, "Error:", err)
+	return 1
+}
+
+func newRootCmd() *cobra.Command {
+	root := &cobra.Command{
+		Use:   progName,
+		Short: "Back up and restore a whole Cinc Server or Chef Infra Server",
+		Long: `cinc-server-backup takes a full backup of a Cinc Server or Chef Infra Server
+into one portable file: users and their keys, organizations, members, ACLs,
+groups, clients, nodes, roles, environments, data bags, every cookbook
+version with its files, cookbook artifacts and every policy revision.
+
+The same file restores into a Cinc Server, a Chef Infra Server, or
+cinc-server-ng. Every object is stored exactly as the server sent it, and a
+manifest of checksums lets you prove later that nothing changed.`,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError{err} })
+	root.AddCommand(newBackupCmd(), newInspectCmd(), newVerifyCmd(), newVersionCmd())
+	return root
+}
+
+// exactlyOneBackup is the Args check for commands that take one backup file.
+func exactlyOneBackup(cmd *cobra.Command, args []string) error {
+	if len(args) != 1 {
+		return usagef("%s needs exactly one backup file, and we got %d", cmd.Name(), len(args))
+	}
+	return nil
+}
+
+func newVersionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Show the version of cinc-server-backup",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			fmt.Fprintf(cmd.OutOrStdout(), "%s %s\n", progName, Version)
+			return nil
+		},
 	}
 }
 
-func backup(args []string, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("backup", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	server := fs.String("server", "", "server URL, e.g. https://chef.example.com")
-	user := fs.String("user", "pivotal", "superuser to sign requests as")
-	keyPath := fs.String("key", "", "path to the superuser's private key")
-	out := fs.String("o", "", "backup file to write")
-	conc := fs.Int("concurrency", 8, "maximum requests in flight")
-	var blobHosts stringList
-	fs.Var(&blobHosts, "blob-host", "extra host[:port] cookbook files may be fetched from, e.g. an S3 bookshelf (repeatable)")
-	if err := fs.Parse(args); err != nil {
-		return fmt.Errorf("%w: %v", errUsage, err)
+type backupFlags struct {
+	server, user, key, output string
+	concurrency               int
+	blobHosts                 []string
+}
+
+func newBackupCmd() *cobra.Command {
+	var f backupFlags
+	cmd := &cobra.Command{
+		Use:   "backup --server <url> --key <pem> -o <file.csb>",
+		Short: "Take a backup of a whole server over its API",
+		Long: `Take a backup of a whole server over its API, signing every request as a
+superuser (pivotal, unless you say otherwise with --user).
+
+The backup is written to <file>.partial and renamed to the name you gave only
+once it is complete, so a file with the final name is always a whole backup.
+It is created readable by you alone, and we never overwrite an existing file.
+
+Cookbook files are fetched only from the server's own host. If your server
+keeps them in an external bookshelf such as S3, allow that host with
+--blob-host.`,
+		Example: `Back up a server with the pivotal key, on the server itself.
+cinc-server-backup backup --server https://chef.example.com --key /etc/opscode/pivotal.pem -o chef.csb
+
+Back up a server whose cookbook files live in an S3 bucket.
+cinc-server-backup backup --server https://chef.example.com --key pivotal.pem \
+  --blob-host chef-bookshelf.s3.us-east-1.amazonaws.com -o chef.csb`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error { return runBackup(cmd, f) },
 	}
-	for _, req := range []struct{ name, val string }{{"--server", *server}, {"--key", *keyPath}, {"-o", *out}} {
+	fl := cmd.Flags()
+	fl.StringVar(&f.server, "server", "", "server URL, such as https://chef.example.com (required)")
+	fl.StringVar(&f.user, "user", "pivotal", "superuser to sign requests as")
+	fl.StringVar(&f.key, "key", "", "path to that superuser's private key (required)")
+	fl.StringVarP(&f.output, "output", "o", "", "backup file to write, such as chef.csb (required)")
+	fl.IntVar(&f.concurrency, "concurrency", 8, "most requests to have in flight at once")
+	fl.StringArrayVar(&f.blobHosts, "blob-host", nil, "extra host[:port] cookbook files may come from, such as an S3 bookshelf (repeatable)")
+	return cmd
+}
+
+func runBackup(cmd *cobra.Command, f backupFlags) error {
+	var missing []string
+	for _, req := range []struct{ name, val string }{{"--server", f.server}, {"--key", f.key}, {"-o", f.output}} {
 		if req.val == "" {
-			return fmt.Errorf("%w: backup needs %s", errUsage, req.name)
+			missing = append(missing, req.name)
 		}
 	}
-	if _, err := os.Stat(*out); err == nil {
-		return fmt.Errorf("%s already exists; refusing to overwrite it", *out)
+	if len(missing) > 0 {
+		return usagef("backup needs %s", strings.Join(missing, ", "))
 	}
-	pem, err := os.ReadFile(*keyPath)
+	if _, err := os.Stat(f.output); err == nil {
+		return fmt.Errorf("%s already exists, and we won't overwrite a backup; choose another -o path or move the old file", f.output)
+	}
+	pem, err := os.ReadFile(f.key)
 	if err != nil {
-		return err
+		return fmt.Errorf("we couldn't read the key: %w", err)
 	}
 	key, err := cinc.ParseKey(pem)
 	if err != nil {
-		return fmt.Errorf("%s: %w", *keyPath, err)
+		return fmt.Errorf("%s isn't a private key we can use: %w", f.key, err)
 	}
-	// Config.Org is required by the client but unused: the crawler sends
-	// absolute paths.
-	opts := capture.Options{Concurrency: *conc, BlobHosts: blobHosts}
+	opts := capture.Options{Concurrency: f.concurrency, BlobHosts: f.blobHosts}
 	// cinc-api follows redirects for cookbook file transfers only; hold every
 	// hop to the same host rules as the manifest's own URL.
-	hc := &http.Client{Timeout: 30 * time.Second, CheckRedirect: capture.RedirectPolicy(*server, opts)}
-	c, err := cinc.NewClient(cinc.Config{ServerURL: *server, Org: "_", ClientName: *user, Key: key},
-		cinc.WithUserAgent("cinc-server-backup/"+Version), cinc.WithHTTPClient(hc))
+	hc := &http.Client{Timeout: 30 * time.Second, CheckRedirect: capture.RedirectPolicy(f.server, opts)}
+	// Config.Org is required by the client but unused: the crawler sends
+	// absolute paths.
+	c, err := cinc.NewClient(cinc.Config{ServerURL: f.server, Org: "_", ClientName: f.user, Key: key},
+		cinc.WithUserAgent(progName+"/"+Version), cinc.WithHTTPClient(hc))
 	if err != nil {
 		return err
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
 	defer stop()
-	partial := *out + ".partial"
-	f, err := os.OpenFile(partial, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	partial := f.output + ".partial"
+	file, err := os.OpenFile(partial, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
 	ok := false
 	defer func() {
 		if !ok {
-			_ = f.Close()
+			_ = file.Close()
 			_ = os.Remove(partial)
 		}
 	}()
-	w := format.NewWriter(f, format.Source{URL: *server})
-	w.SetTool("cinc-server-backup " + Version)
+	w := format.NewWriter(file, format.Source{URL: f.server})
+	w.SetTool(progName + " " + Version)
 	if err := capture.FromAPI(ctx, c, w, opts); err != nil {
 		return err
 	}
 	if err := w.Close(); err != nil {
 		return err
 	}
-	if err := f.Sync(); err != nil {
+	if err := file.Sync(); err != nil {
 		return err
 	}
-	if err := f.Close(); err != nil {
+	if err := file.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(partial, *out); err != nil {
+	if err := os.Rename(partial, f.output); err != nil {
 		return err
 	}
 	ok = true
-	fmt.Fprintf(stdout, "wrote %s\n", *out)
+	fmt.Fprintf(cmd.OutOrStdout(), "Wrote %s\n", f.output)
 	return nil
 }
 
-// openArg opens the single backup file named in args.
-func openArg(cmd string, args []string) (*format.Reader, io.Closer, error) {
-	if len(args) != 1 {
-		return nil, nil, fmt.Errorf("%w: %s <backup.csb>", errUsage, cmd)
+func newVerifyCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "verify <file.csb>",
+		Short: "Check that a backup is complete and unchanged",
+		Long: `Check every file in a backup against the checksums in its manifest. Verify
+fails if anything was changed, removed or added since the backup was written.`,
+		Example: `Check a backup before relying on it.
+cinc-server-backup verify chef.csb`,
+		Args: exactlyOneBackup,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			r, f, err := format.Open(args[0])
+			if err != nil {
+				return err
+			}
+			defer func() { _ = f.Close() }() // read-only
+			if err := r.Verify(); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "ok: %d entries verified\n", len(r.Manifest().Entries))
+			return nil
+		},
 	}
-	return format.Open(args[0])
 }
 
-func verify(args []string, stdout io.Writer) error {
-	r, f, err := openArg("verify", args)
-	if err != nil {
-		return err
+func newInspectCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "inspect <file.csb>",
+		Short: "Show what a backup contains",
+		Long: `Show where and when a backup was taken, how many of each kind of object it
+holds, and any warnings, such as objects deleted while the backup ran. Inspect
+reads only the manifest; use verify to check the contents.`,
+		Example: `Show what a backup holds.
+cinc-server-backup inspect chef.csb`,
+		Args: exactlyOneBackup,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			r, f, err := format.Open(args[0])
+			if err != nil {
+				return err
+			}
+			defer func() { _ = f.Close() }() // read-only
+			return printManifest(cmd.OutOrStdout(), r.Manifest())
+		},
 	}
-	defer f.Close()
-	if err := r.Verify(); err != nil {
-		return err
-	}
-	fmt.Fprintf(stdout, "ok: %d entries verified\n", len(r.Manifest().Entries))
-	return nil
 }
 
-func inspect(args []string, stdout io.Writer) error {
-	r, f, err := openArg("inspect", args)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	m := r.Manifest()
-	tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+func printManifest(out io.Writer, m format.Manifest) error {
+	tw := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
 	fmt.Fprintf(tw, "format\t%s v%d\n", m.Format, m.Version)
 	fmt.Fprintf(tw, "tool\t%s\n", m.Tool)
 	fmt.Fprintf(tw, "source\t%s\n", m.Source.URL)
@@ -196,9 +277,3 @@ func inspect(args []string, stdout io.Writer) error {
 	}
 	return tw.Flush()
 }
-
-// stringList is a repeatable string flag.
-type stringList []string
-
-func (l *stringList) String() string     { return strings.Join(*l, ",") }
-func (l *stringList) Set(v string) error { *l = append(*l, v); return nil }
