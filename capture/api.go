@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"sort"
 	"strings"
@@ -48,13 +49,7 @@ func FromAPI(ctx context.Context, c *cinc.Client, w *format.Writer, opts Options
 	}
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	cr := &crawler{c: c, w: w, sem: make(chan struct{}, n), cancel: cancel, blobHosts: map[string]bool{}}
-	if u, err := url.Parse(c.ServerURL()); err == nil {
-		cr.blobHosts[strings.ToLower(u.Host)] = true
-	}
-	for _, h := range opts.BlobHosts {
-		cr.blobHosts[strings.ToLower(h)] = true
-	}
+	cr := &crawler{c: c, w: w, sem: make(chan struct{}, n), cancel: cancel, blobHosts: blobHosts(c.ServerURL(), opts)}
 	cr.spawn(ctx, cr.users)
 	cr.spawn(ctx, cr.orgs)
 	cr.wg.Wait()
@@ -72,7 +67,7 @@ type crawler struct {
 	cancel context.CancelCauseFunc
 	blobs  sync.Map // md5 -> struct{}: claimed by one fetcher
 	// blobHosts are the hosts cookbook files may be fetched from.
-	blobHosts map[string]bool
+	blobHosts hostSet
 }
 
 // spawn runs fn in its own goroutine once a slot is free. The first error
@@ -384,13 +379,46 @@ func (cr *crawler) checkBlobURL(raw string) error {
 	if err != nil {
 		return fmt.Errorf("refusing to fetch cookbook file: bad URL: %w", err)
 	}
+	return cr.blobHosts.check(u)
+}
+
+// hostSet is the set of hosts cookbook files may be fetched from.
+type hostSet map[string]bool
+
+func blobHosts(serverURL string, opts Options) hostSet {
+	hs := hostSet{}
+	if u, err := url.Parse(serverURL); err == nil {
+		hs[strings.ToLower(u.Host)] = true
+	}
+	for _, h := range opts.BlobHosts {
+		hs[strings.ToLower(h)] = true
+	}
+	return hs
+}
+
+func (hs hostSet) check(u *url.URL) error {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return fmt.Errorf("refusing to fetch cookbook file over %q: only http and https are allowed", u.Scheme)
 	}
-	if !cr.blobHosts[strings.ToLower(u.Host)] {
+	if !hs[strings.ToLower(u.Host)] {
 		return fmt.Errorf("refusing to fetch cookbook file from host %s: not the server's host; allow an external bookshelf with --blob-host %s", u.Host, u.Host)
 	}
 	return nil
+}
+
+// RedirectPolicy returns an http.Client CheckRedirect that applies FromAPI's
+// file-host rules to every redirect hop, so an allowed host cannot send a
+// cookbook file fetch elsewhere. Install it on the client passed to FromAPI:
+// cinc-api follows redirects for file transfers (S3 redirects across
+// regions) and never for signed requests.
+func RedirectPolicy(serverURL string, opts Options) func(*http.Request, []*http.Request) error {
+	hs := blobHosts(serverURL, opts)
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("refusing to fetch cookbook file: more than 10 redirects")
+		}
+		return hs.check(req.URL)
+	}
 }
 
 type fileRef struct{ checksum, url string }

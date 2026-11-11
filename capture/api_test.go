@@ -230,3 +230,75 @@ func TestFileURLWithOtherSchemeIsRefused(t *testing.T) {
 		}
 	}
 }
+
+// redirectingServer serves one cookbook whose file URL is on the server
+// itself but redirects to target.
+func redirectingServer(t *testing.T, target string) *httptest.Server {
+	t.Helper()
+	routes := map[string]route{
+		"/organizations": {body: `{"acme":"u"}`},
+		"/organizations/acme/cookbooks?num_versions=all": {body: `{"nginx":{"versions":[{"version":"1.0.0"}]}}`},
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/bookshelf/x", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target, http.StatusFound)
+	})
+	inner := fakeServer(t, routes)
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inner.Config.Handler.ServeHTTP(w, r)
+	}))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	routes["/organizations/acme/cookbooks/nginx/1.0.0"] = route{body: `{"all_files":[{"name":"recipes/default.rb","checksum":"` +
+		md5hex("x") + `","url":"` + srv.URL + `/bookshelf/x"}]}`}
+	return srv
+}
+
+func clientWithPolicy(t *testing.T, serverURL string, opts Options) *cinc.Client {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hc := &http.Client{CheckRedirect: RedirectPolicy(serverURL, opts)}
+	c, err := cinc.NewClient(cinc.Config{ServerURL: serverURL, Org: "_", ClientName: "pivotal", Key: key},
+		cinc.WithHTTPClient(hc), cinc.WithMaxRetries(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// A file URL on an allowed host must not be able to redirect the fetch to
+// a host that is not allowed.
+func TestRedirectToDisallowedHostIsRefused(t *testing.T) {
+	other := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		t.Errorf("redirect followed to %s", r.URL)
+	}))
+	t.Cleanup(other.Close)
+	srv := redirectingServer(t, other.URL+"/x")
+
+	var buf bytes.Buffer
+	err := FromAPI(context.Background(), clientWithPolicy(t, srv.URL, Options{}), format.NewWriter(&buf, format.Source{}), Options{})
+	if err == nil || !strings.Contains(err.Error(), "refusing") {
+		t.Fatalf("err = %v, want a refused redirect", err)
+	}
+}
+
+func TestRedirectToAllowedHostIsFollowed(t *testing.T) {
+	bucket := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("x"))
+	}))
+	t.Cleanup(bucket.Close)
+	srv := redirectingServer(t, bucket.URL+"/x")
+	opts := Options{BlobHosts: []string{strings.TrimPrefix(bucket.URL, "http://")}}
+
+	var buf bytes.Buffer
+	w := format.NewWriter(&buf, format.Source{})
+	if err := FromAPI(context.Background(), clientWithPolicy(t, srv.URL, opts), w, opts); err != nil {
+		t.Fatal(err)
+	}
+	if !w.HasBlob(md5hex("x")) {
+		t.Fatal("blob not stored")
+	}
+}

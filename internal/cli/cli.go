@@ -7,11 +7,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	cinc "github.com/cinc-project/cinc-api"
 
@@ -95,8 +97,12 @@ func backup(args []string, stdout, stderr io.Writer) error {
 	}
 	// Config.Org is required by the client but unused: the crawler sends
 	// absolute paths.
+	opts := capture.Options{Concurrency: *conc, BlobHosts: blobHosts}
+	// cinc-api follows redirects for cookbook file transfers only; hold every
+	// hop to the same host rules as the manifest's own URL.
+	hc := &http.Client{Timeout: 30 * time.Second, CheckRedirect: capture.RedirectPolicy(*server, opts)}
 	c, err := cinc.NewClient(cinc.Config{ServerURL: *server, Org: "_", ClientName: *user, Key: key},
-		cinc.WithUserAgent("cinc-server-backup/"+Version))
+		cinc.WithUserAgent("cinc-server-backup/"+Version), cinc.WithHTTPClient(hc))
 	if err != nil {
 		return err
 	}
@@ -117,7 +123,7 @@ func backup(args []string, stdout, stderr io.Writer) error {
 	}()
 	w := format.NewWriter(f, format.Source{URL: *server})
 	w.SetTool("cinc-server-backup " + Version)
-	if err := capture.FromAPI(ctx, c, w, capture.Options{Concurrency: *conc, BlobHosts: blobHosts}); err != nil {
+	if err := capture.FromAPI(ctx, c, w, opts); err != nil {
 		return err
 	}
 	if err := w.Close(); err != nil {
