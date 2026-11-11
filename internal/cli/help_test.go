@@ -86,3 +86,16 @@ func TestHelpTextHasNoEmDashes(t *testing.T) {
 	}
 	walk(newRootCmd())
 }
+
+func TestRestoreHelpAndUsage(t *testing.T) {
+	code, out, _ := run("restore", "--help")
+	if code != 0 || !strings.Contains(out, "cinc-server-backup restore chef.csb --server") || !strings.Contains(out, "--key") {
+		t.Fatalf("restore --help = %d:\n%s", code, out)
+	}
+	if code, _, errOut := run("restore", "--server", "https://x", "--key", "k.pem"); code != 2 || !strings.Contains(errOut, "backup file") {
+		t.Errorf("restore without a file = %d %q", code, errOut)
+	}
+	if code, _, errOut := run("restore", "x.csb", "--key", "k.pem"); code != 2 || !strings.Contains(errOut, "--server") {
+		t.Errorf("restore without --server = %d %q", code, errOut)
+	}
+}

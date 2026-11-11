@@ -6,7 +6,7 @@ module github.com/cinc-project/cinc-server-backup/integration
 go 1.27.1
 
 require (
-	github.com/cinc-project/cinc-api v0.18.1
+	github.com/cinc-project/cinc-api v0.19.0
 	github.com/cinc-project/cinc-server-backup v0.0.0
 	github.com/cinc-project/cinc-server-ng v0.18.0
 )

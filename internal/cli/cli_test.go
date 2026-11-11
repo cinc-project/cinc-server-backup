@@ -251,3 +251,39 @@ func TestBackupFollowsRedirectsOnlyToAllowedHosts(t *testing.T) {
 		t.Fatalf("with --blob-host: %d %q", code, errOut)
 	}
 }
+
+// A backup that fails verification is refused before any request is sent.
+func TestRestoreRefusesCorruptBackupBeforeTouchingServer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		t.Errorf("request sent to the target: %s %s", r.Method, r.URL)
+	}))
+	t.Cleanup(srv.Close)
+	path := writeBackup(t)
+	tamper(t, path, "orgs/acme/nodes/a.json")
+	code, _, errOut := run("restore", path, "--server", srv.URL, "--key", writeKey(t))
+	if code != 1 || !strings.Contains(errOut, "checksum") {
+		t.Fatalf("restore = %d %q; want 1 and a checksum failure", code, errOut)
+	}
+}
+
+// tamper replaces one member's content, keeping the manifest's digest.
+func tamper(t *testing.T, path, member string) {
+	t.Helper()
+	data, _ := os.ReadFile(path)
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, f := range zr.File {
+		if f.Name == member {
+			fw, _ := zw.Create(f.Name)
+			_, _ = fw.Write([]byte(`{"tampered":true}`))
+			continue
+		}
+		_ = zw.Copy(f)
+	}
+	_ = zw.Close()
+	_ = os.WriteFile(path, buf.Bytes(), 0o600)
+}
