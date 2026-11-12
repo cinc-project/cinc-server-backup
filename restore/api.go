@@ -37,6 +37,12 @@ type Options struct {
 	// Merge says what to do with what the target already holds. Empty
 	// (MergeNone) refuses a target holding any org or user being restored.
 	Merge Merge
+	// DryRun plans the restore without changing the target: it reads what it
+	// needs to decide, records each write instead of sending it, and reports
+	// what it would do. Reasons the restore would refuse to start go to
+	// Report.Conflicts rather than failing, and the plan carries on as if
+	// they had been allowed (--merge skip, --dangling drop).
+	DryRun bool
 }
 
 // Report says what a restore did.
@@ -49,6 +55,11 @@ type Report struct {
 	Skipped map[string]int
 	// Warnings lists what was left out, and why.
 	Warnings []format.Warning
+	// Writes lists the requests a dry run would send, sorted by path.
+	Writes []Write
+	// Conflicts lists why a dry-run restore would refuse to start. Empty
+	// means it would run.
+	Conflicts []string
 }
 
 func (r *Report) add(kind string) { r.mu.Lock(); r.Restored[kind]++; r.mu.Unlock() }
@@ -78,7 +89,7 @@ func ToAPI(ctx context.Context, r *format.Reader, c *cinc.Client, opts Options) 
 		mode = DanglingDrop
 	}
 	rs := &restorer{
-		r: r, c: c, n: n, super: c.ClientName(), merge: opts.Merge, track: newTracker(),
+		r: r, c: c, n: n, super: c.ClientName(), merge: opts.Merge, track: newTracker(), dry: opts.DryRun,
 		rep: &Report{Restored: map[string]int{}, Skipped: map[string]int{}},
 	}
 	sel, err := refs.Select(r, opts.Orgs, opts.ExcludeOrgs)
@@ -91,6 +102,15 @@ func ToAPI(ctx context.Context, r *format.Reader, c *cinc.Client, opts Options) 
 	users := rs.users()
 	if err := rs.preflight(ctx, orgs, users); err != nil {
 		return nil, err
+	}
+	if rs.dry && mode == DanglingFail {
+		// Plan as drop, and say the real run would stop on them.
+		mode = DanglingDrop
+		defer func() {
+			if n := countDangling(rs.rep.Warnings); n > 0 {
+				rs.rep.conflict(fmt.Sprintf("the backup names %d users, clients or groups it doesn't hold (--dangling fail)", n))
+			}
+		}()
 	}
 	warns, err := rs.resolve(ctx, mode)
 	if err != nil {
@@ -111,6 +131,7 @@ func ToAPI(ctx context.Context, r *format.Reader, c *cinc.Client, opts Options) 
 		return rs.rep, err
 	}
 	sort.Slice(rs.rep.Warnings, func(i, j int) bool { return rs.rep.Warnings[i].Path < rs.rep.Warnings[j].Path })
+	rs.rep.sortWrites()
 	return rs.rep, nil
 }
 
@@ -126,6 +147,9 @@ type restorer struct {
 	track *tracker
 	// onTarget lists the orgs and users the target held before this run.
 	onTarget map[string]bool
+	dry      bool
+	// planned counts, per org, the cookbook files a dry run would upload.
+	planned sync.Map
 }
 
 // each runs fn for every item, at most n at a time, and returns the first
@@ -163,6 +187,10 @@ func (rs *restorer) each(ctx context.Context, items []string, fn func(context.Co
 func (rs *restorer) do(ctx context.Context, method, p string, body []byte, v string) ([]byte, error) {
 	if v == "" {
 		v = "1"
+	}
+	if rs.dry && method != "GET" {
+		rs.rep.record(method, p)
+		return nil, nil
 	}
 	// cinc-api's errors already name the method and path.
 	data, _, err := rs.c.Do(cinc.WithServerAPIVersion(ctx, v), method, p, body)
@@ -237,6 +265,13 @@ func (rs *restorer) preflight(ctx context.Context, orgs, users []string) error {
 		if err := check("/users/"+esc(u), "user "+u); err != nil {
 			return err
 		}
+	}
+	if len(clash) > 0 && rs.merge != MergeSkip && rs.dry {
+		for _, c := range clash {
+			rs.rep.conflict("the target already has " + c + " (--merge skip would keep it)")
+		}
+		rs.merge = MergeSkip // plan the rest as --merge skip would run it
+		return nil
 	}
 	if len(clash) > 0 && rs.merge != MergeSkip {
 		return fmt.Errorf("the target already has %s; restore needs a server without them, or --merge skip to keep what it has and add the rest", strings.Join(clash, ", "))
@@ -360,10 +395,11 @@ func (rs *restorer) org(ctx context.Context, o string) error {
 				continue
 			}
 			b, _ := json.Marshal(map[string]string{"username": m.User.Username})
-			if ok, err := rs.write(ctx, "members", "POST", base+"/users", b); err != nil {
+			if ok, err := rs.write(ctx, "members", "POST", base+"/users", b, rs.at(o, base+"/users/"+esc(m.User.Username))); err != nil {
 				return err
 			} else if ok {
 				rs.rep.add("members")
+				rs.joins(o, "users", m.User.Username) // and a new member to the users group
 			}
 		}
 	}
@@ -379,7 +415,7 @@ func (rs *restorer) org(ctx context.Context, o string) error {
 				continue
 			}
 			b, _ := json.Marshal(map[string]string{"user": inv.Username})
-			if ok, err := rs.write(ctx, "invitations", "POST", base+"/association_requests", b); err != nil {
+			if ok, err := rs.write(ctx, "invitations", "POST", base+"/association_requests", b, func(ctx context.Context) (bool, error) { return rs.invited(ctx, o, inv.Username) }); err != nil {
 				return err
 			} else if ok {
 				rs.rep.add("invitations")
@@ -390,7 +426,10 @@ func (rs *restorer) org(ctx context.Context, o string) error {
 }
 
 // existing lists the names in a target collection.
-func (rs *restorer) existing(ctx context.Context, p string) (map[string]bool, error) {
+func (rs *restorer) existing(ctx context.Context, o, coll, p string) (map[string]bool, error) {
+	if rs.dry && rs.track.newOrg(o) {
+		return orgDefaults(o, coll), nil // the org doesn't exist yet to ask
+	}
 	data, err := rs.do(ctx, "GET", p, nil, "1")
 	if err != nil {
 		return nil, err
@@ -420,7 +459,7 @@ func (rs *restorer) orgContents(ctx context.Context, o string) error {
 
 func (rs *restorer) containers(ctx context.Context, o string) error {
 	base := "/organizations/" + esc(o) + "/containers"
-	have, err := rs.existing(ctx, base)
+	have, err := rs.existing(ctx, o, "containers", base)
 	if err != nil {
 		return err
 	}
@@ -443,7 +482,7 @@ func (rs *restorer) containers(ctx context.Context, o string) error {
 
 func (rs *restorer) clients(ctx context.Context, o string) error {
 	base := "/organizations/" + esc(o) + "/clients"
-	have, err := rs.existing(ctx, base)
+	have, err := rs.existing(ctx, o, "clients", base)
 	if err != nil {
 		return err
 	}
@@ -493,6 +532,7 @@ func (rs *restorer) clients(ctx context.Context, o string) error {
 				return err
 			}
 			rs.track.madeObject(o, "clients", name)
+			rs.joins(o, "clients", name) // the server adds a new client to the clients group
 		}
 		rs.rep.add("clients")
 		return rs.extraKeys(ctx, dir, cbase, "client")
@@ -512,7 +552,7 @@ func stringsOf(v any) []string {
 
 func (rs *restorer) groups(ctx context.Context, o string) error {
 	base := "/organizations/" + esc(o) + "/groups"
-	have, err := rs.existing(ctx, base)
+	have, err := rs.existing(ctx, o, "groups", base)
 	if err != nil {
 		return err
 	}
@@ -546,12 +586,14 @@ func (rs *restorer) groups(ctx context.Context, o string) error {
 		}
 		// Keep the per-user groups the target made when members joined; the
 		// backup's are named after ids the target does not have.
-		cur, err := rs.do(ctx, "GET", base+"/"+esc(g), nil, "1")
-		if err != nil {
-			return err
-		}
 		var target map[string]any
-		_ = json.Unmarshal(cur, &target)
+		if !rs.dry || !rs.track.created(o, "groups", g) {
+			cur, err := rs.do(ctx, "GET", base+"/"+esc(g), nil, "1")
+			if err != nil {
+				return err
+			}
+			_ = json.Unmarshal(cur, &target)
+		}
 		// Dangling names were reported by resolve.
 		users, clients, groups, _ := rs.refs.Members(o, doc)
 		users = rs.withoutStrangers(o, "users", users)
@@ -559,8 +601,8 @@ func (rs *restorer) groups(ctx context.Context, o string) error {
 		if !rs.track.created(o, "groups", g) {
 			// The target's group: add the backup's members it lacks.
 			var cu, cc, cg bool
-			users, cu = union(stringsOf(target["users"]), users)
-			clients, cc = union(stringsOf(target["clients"]), clients)
+			users, cu = union(append(stringsOf(target["users"]), rs.joined(o, g, "users")...), users)
+			clients, cc = union(append(stringsOf(target["clients"]), rs.joined(o, g, "clients")...), clients)
 			groups, cg = union(stringsOf(target["groups"]), groups)
 			if !cu && !cc && !cg {
 				rs.rep.skip("groups")
@@ -599,7 +641,7 @@ func (rs *restorer) plainObjects(ctx context.Context, o string) error {
 			if err != nil {
 				return err
 			}
-			if ok, err := rs.write(ctx, coll, "POST", base, data); err != nil || !ok {
+			if ok, err := rs.write(ctx, coll, "POST", base, data, rs.at(o, base+"/"+esc(n))); err != nil || !ok {
 				return err
 			}
 			rs.track.madeObject(o, coll, n)
@@ -616,7 +658,7 @@ func (rs *restorer) dataBags(ctx context.Context, o string) error {
 	base := "/organizations/" + esc(o) + "/data"
 	return rs.each(ctx, rs.names("orgs/"+o+"/data_bags/"), func(ctx context.Context, bag string) error {
 		b, _ := json.Marshal(map[string]string{"name": bag})
-		if ok, err := rs.write(ctx, "data_bags", "POST", base, b); err != nil {
+		if ok, err := rs.write(ctx, "data_bags", "POST", base, b, rs.at(o, base+"/"+esc(bag))); err != nil {
 			return err
 		} else if ok {
 			rs.track.madeObject(o, "data", bag)
@@ -627,7 +669,7 @@ func (rs *restorer) dataBags(ctx context.Context, o string) error {
 			if err != nil {
 				return err
 			}
-			if ok, err := rs.write(ctx, "data_bag_items", "POST", base+"/"+esc(bag), data); err != nil {
+			if ok, err := rs.write(ctx, "data_bag_items", "POST", base+"/"+esc(bag), data, rs.at(o, base+"/"+esc(bag)+"/"+esc(item))); err != nil {
 				return err
 			} else if ok {
 				rs.rep.add("data_bag_items")
@@ -707,6 +749,16 @@ func (rs *restorer) manifests(ctx context.Context, o, coll, kind string) error {
 // upload puts files the org does not have yet into a sandbox and commits it.
 func (rs *restorer) upload(ctx context.Context, org string, files []format.File) error {
 	if len(files) == 0 {
+		return nil
+	}
+	if rs.dry {
+		// Without a sandbox there's no needs_upload to read: count each file
+		// once per org. For an org the target already has, some may be there.
+		for _, f := range files {
+			if _, seen := rs.planned.LoadOrStore(org+"\x00"+f.Checksum, true); !seen {
+				rs.rep.add("files")
+			}
+		}
 		return nil
 	}
 	sums := map[string]any{}
@@ -809,9 +861,9 @@ func (rs *restorer) policies(ctx context.Context, o string) error {
 		if err != nil {
 			return err
 		}
-		name, _ := path.Split(pr)
+		name, rev := path.Split(pr)
 		name = strings.TrimSuffix(name, "/")
-		if ok, err := rs.write(ctx, "policy_revisions", "POST", org+"/policies/"+esc(name)+"/revisions", data); err != nil || !ok {
+		if ok, err := rs.write(ctx, "policy_revisions", "POST", org+"/policies/"+esc(name)+"/revisions", data, rs.at(o, org+"/policies/"+esc(name)+"/revisions/"+esc(rev))); err != nil || !ok {
 			return err
 		}
 		if !havePolicies[name] {

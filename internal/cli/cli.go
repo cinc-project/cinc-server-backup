@@ -3,6 +3,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -56,6 +57,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 	if errors.Is(err, errDifferent) {
 		return 1 // the command printed what differs
+	}
+	if errors.Is(err, errRefused) {
+		return 1 // the plan printed why
 	}
 	if errors.Is(err, errDropped) {
 		return 3 // verify printed what was dropped
@@ -233,6 +237,8 @@ type restoreFlags struct {
 	noVerify          bool
 	orgs, excludeOrgs []string
 	merge             string
+	plan              bool
+	planOut           string
 }
 
 func newRestoreCmd() *cobra.Command {
@@ -269,6 +275,12 @@ and permissions the target already has gain the backup's members and entries
 they lack; none are removed. The check at the end then reports anything the
 target holds differently from the backup.
 
+--plan shows what the restore would do and changes nothing: what it would
+restore, what it would leave as it is, what it would leave out, and anything
+that would make it refuse to start. It reads the target to decide, so the
+plan is for the target as it is now. --plan-out also writes it as JSON,
+including every request the restore would send.
+
 --org restores only the organizations you name, and --exclude-org leaves
 some out. The users those organizations name come along: members, invitees,
 group members, ACL entries, and the users named in those users' own ACLs.
@@ -286,6 +298,9 @@ cinc-server-backup restore chef.csb --server https://new-chef.example.com --key 
 Restore one organization, and the users it names, out of a whole-server backup.
 cinc-server-backup restore chef.csb --server https://new-chef.example.com --key pivotal.pem --org acme
 
+See what a restore would do first, without changing anything.
+cinc-server-backup restore chef.csb --server https://new-chef.example.com --key pivotal.pem --plan
+
 Restore a second organization into a server that already has users it shares.
 cinc-server-backup restore chef.csb --server https://new-chef.example.com --key pivotal.pem --org beta --merge skip
 
@@ -302,6 +317,8 @@ cinc-server-backup restore chef.csb --server https://new-chef.example.com --key 
 	fl.StringArrayVar(&f.blobHosts, "blob-host", nil, "extra host[:port] file uploads may be redirected to, such as an S3 bookshelf (repeatable)")
 	fl.StringVar(&f.dangling, "dangling", string(restore.DanglingDrop), "what to do with ACL entries and group members the backup can't resolve: drop or fail")
 	fl.BoolVar(&f.noVerify, "no-verify", false, "don't back the target up and compare it with the backup afterwards")
+	fl.BoolVar(&f.plan, "plan", false, "show what the restore would do, and change nothing")
+	fl.StringVar(&f.planOut, "plan-out", "", "with --plan, also write the plan as JSON to this file")
 	fl.StringVar(&f.merge, "merge", "", "restore into a server that already holds some of the backup: skip keeps what it has and adds what's missing")
 	orgFlags(fl, &f.orgs, &f.excludeOrgs)
 	return cmd
@@ -315,6 +332,14 @@ func runRestore(cmd *cobra.Command, file string, f restoreFlags) error {
 	merge, err := restore.ParseMerge(f.merge)
 	if err != nil {
 		return usagef("%v", err)
+	}
+	if f.planOut != "" && !f.plan {
+		return usagef("--plan-out needs --plan")
+	}
+	if f.planOut != "" {
+		if _, err := os.Stat(f.planOut); err == nil {
+			return fmt.Errorf("%s already exists, and we won't overwrite it; choose another --plan-out path", f.planOut)
+		}
 	}
 	var missing []string
 	for _, req := range []struct{ name, val string }{{"--server", f.server}, {"--key", f.key}} {
@@ -345,13 +370,16 @@ func runRestore(cmd *cobra.Command, file string, f restoreFlags) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
 	defer stop()
 	rep, err := restore.ToAPI(ctx, r, c, restore.Options{
-		Concurrency: f.concurrency, Dangling: dangling, Orgs: sel.Orgs, Merge: merge,
+		Concurrency: f.concurrency, Dangling: dangling, Orgs: sel.Orgs, Merge: merge, DryRun: f.plan,
 	})
 	if rep != nil {
-		printReport(out, rep)
+		printReport(out, rep, f.plan)
 	}
 	if err != nil {
 		return err
+	}
+	if f.plan {
+		return finishPlan(out, rep, f.planOut)
 	}
 	if f.noVerify {
 		return nil
@@ -360,19 +388,75 @@ func runRestore(cmd *cobra.Command, file string, f restoreFlags) error {
 	return checkServer(ctx, out, r, sel, file, f.server, f.user, c, capture.Options{Concurrency: f.concurrency, BlobHosts: f.blobHosts})
 }
 
-func printReport(out io.Writer, rep *restore.Report) {
+// errRefused is a plan's "the restore would refuse to start": exit 1 after
+// the plan, which already says why.
+var errRefused = errors.New("the restore would refuse to start")
+
+// finishPlan writes the plan file, if asked, and says whether the restore
+// would run.
+func finishPlan(out io.Writer, rep *restore.Report, path string) error {
+	if path != "" {
+		data, err := json.MarshalIndent(map[string]any{
+			"conflicts": nonNil(rep.Conflicts), "restore": rep.Restored, "skip": rep.Skipped,
+			"left_out": rep.Warnings, "writes": rep.Writes,
+		}, "", "  ")
+		if err != nil {
+			return err
+		}
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return err
+		}
+		if _, err := f.Write(append(data, '\n')); err != nil {
+			_ = f.Close()
+			return err
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "\nwrote the plan (%d writes) to %s\n", len(rep.Writes), path)
+	}
+	if len(rep.Conflicts) == 0 {
+		fmt.Fprintf(out, "\nnothing was changed; %d writes planned\n", len(rep.Writes))
+		return nil
+	}
+	fmt.Fprintln(out, "\nnothing was changed, and the restore would refuse to start:")
+	for _, c := range rep.Conflicts {
+		fmt.Fprintf(out, "  %s\n", c)
+	}
+	fmt.Fprintln(out, "(the plan above is what it would do if those were allowed)")
+	return errRefused
+}
+
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
+
+func printReport(out io.Writer, rep *restore.Report, planned bool) {
 	tw := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
 	keys := make([]string, 0, len(rep.Restored))
 	for k := range rep.Restored {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	fmt.Fprintln(tw, "restored")
+	head, skipHead, leftHead := "restored", "already on the target, left as it was", "left out"
+	if planned {
+		head, skipHead, leftHead = "plan: would restore", "would leave as it is (already on the target)", "would leave out"
+	}
+	fmt.Fprintln(tw, head)
 	for _, k := range keys {
-		fmt.Fprintf(tw, "  %s\t%d\n", k, rep.Restored[k])
+		label := k
+		if planned && k == "files" {
+			// Only the target's sandbox can say which files it already has.
+			label = "files (at most)"
+		}
+		fmt.Fprintf(tw, "  %s\t%d\n", label, rep.Restored[k])
 	}
 	if len(rep.Skipped) > 0 {
-		fmt.Fprintln(tw, "\nalready on the target, left as it was")
+		fmt.Fprintln(tw, "\n"+skipHead)
 		skipped := make([]string, 0, len(rep.Skipped))
 		for k := range rep.Skipped {
 			skipped = append(skipped, k)
@@ -383,7 +467,7 @@ func printReport(out io.Writer, rep *restore.Report) {
 		}
 	}
 	if len(rep.Warnings) > 0 {
-		fmt.Fprintf(tw, "\nleft out (%d)\n", len(rep.Warnings))
+		fmt.Fprintf(tw, "\n%s (%d)\n", leftHead, len(rep.Warnings))
 		for _, w := range rep.Warnings {
 			fmt.Fprintf(tw, "  %s\t%s\t%s\n", w.Code, w.Path, w.Detail)
 		}
