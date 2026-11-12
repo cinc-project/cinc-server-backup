@@ -11,7 +11,7 @@ It replaces knife-ec-backup. You'll want it when you need to:
 - **pull one organization out** of a server, into a server of its own;
 - **check a server against a backup** to see whether anything is missing or has changed.
 
-> **Status:** everything below works today over the server's API. Still to come: carrying user passwords and server-admins across (they need access to the server's database), making a server match a backup by overwriting or deleting what it holds, and previewing a restore. See [What isn't carried over yet](#what-isnt-carried-over-yet).
+> **Status:** everything below works today over the server's API. Still to come: carrying user passwords and server-admins across (they need access to the server's database), and making a server match a backup by overwriting or deleting what it holds. See [What isn't carried over yet](#what-isnt-carried-over-yet).
 
 ## Contents
 
@@ -21,6 +21,7 @@ It replaces knife-ec-backup. You'll want it when you need to:
 - [Move to a new server](#move-to-a-new-server)
 - [Restore one organization](#restore-one-organization)
 - [Restore into a server that already has data](#restore-into-a-server-that-already-has-data)
+- [Preview a restore](#preview-a-restore)
 - [Check a server against a backup](#check-a-server-against-a-backup)
 - [See what changed between two backups](#see-what-changed-between-two-backups)
 - [When a backup names someone who no longer exists](#when-a-backup-names-someone-who-no-longer-exists)
@@ -224,6 +225,38 @@ already on the target, left as it was
 
 The check at the end still compares everything against the backup. So if the server holds something differently from the backup, such as a role someone edited, it shows up under differences and the run exits 1. That's how you find out what `--merge skip` didn't change.
 
+## Preview a restore
+
+Add `--plan` to any `restore` to see what it would do, without changing anything on the server:
+
+```sh
+cinc-server-backup restore chef.csb --server https://new-chef.example.com --key pivotal.pem --plan
+```
+```
+plan: would restore
+  acls               156
+  cookbook_versions  8
+  files (at most)    16
+  nodes              107
+  users              2
+  ...
+
+nothing was changed; 936 writes planned
+```
+
+With `--merge skip`, a "would leave as it is (already on the target)" section lists what the server already has.
+
+The plan reads the server to make the same decisions the restore would make, so it's accurate for the server as it is now:
+- what it would restore, and what it would leave as it is;
+- names it would leave out (see [above](#when-a-backup-names-someone-who-no-longer-exists));
+- same-named users and clients it wouldn't trust.
+
+`files (at most)` is an upper bound: only the server can say which cookbook files it already has, and finding out means starting an upload.
+
+If the restore would refuse to start (the server already has an org without `--merge skip`, or `--dangling fail` finds names to drop), the plan still shows what it would do, lists every reason after it, and exits 1.
+
+`--plan-out plan.json` also writes the plan as JSON, including every request the restore would send, for review or a change ticket.
+
 ## Check a server against a backup
 
 `verify --server` backs a server up into a temporary file, compares it with a backup, and prints the same fidelity report that `restore` ends with. The temporary file is readable only by you and deleted when the check finishes. Use it to:
@@ -314,7 +347,7 @@ These need access to the server's database, not just its API, and are planned ne
 Also planned:
 
 - **Making a server match a backup** by overwriting objects it holds differently (`--merge overwrite`) and deleting ones the backup doesn't have (`--prune`). `--merge skip` only adds.
-- **Previewing a restore** before it writes anything.
+- **Resuming a restore** from where it stopped, without re-reading the server. `--merge skip` already finishes a stopped restore; a journal would make that faster.
 
 ## Keeping backups safe
 

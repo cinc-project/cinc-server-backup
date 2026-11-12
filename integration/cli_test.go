@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cinc-project/cinc-server-backup/internal/cli"
 )
@@ -495,5 +499,154 @@ func TestCLIMergeSkipDifferentExternalLogin(t *testing.T) {
 	}
 	if _, _, err := other.client(t, "").Do(ctx, "GET", "/organizations/acme/users/alice", nil); err == nil {
 		t.Error("the other alice was made a member of acme")
+	}
+}
+
+// planOf runs restore --plan with args and returns the restore's counts from
+// the JSON plan, the exit code and the output.
+func (c cliEnv) planOf(args ...string) (map[string]map[string]int, int, string) {
+	c.t.Helper()
+	path := filepath.Join(c.dir, fmt.Sprintf("plan-%d.json", time.Now().UnixNano()))
+	code, out := c.run(append(append([]string{"restore"}, args...), "--plan", "--plan-out", path)...)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		c.t.Fatalf("plan file: %v\n%s", err, out)
+	}
+	var p struct {
+		Restore map[string]int `json:"restore"`
+		Skip    map[string]int `json:"skip"`
+	}
+	if err := json.Unmarshal(data, &p); err != nil {
+		c.t.Fatal(err)
+	}
+	return map[string]map[string]int{"restore": p.Restore, "skip": p.Skip}, code, out
+}
+
+// countsOf reads a restore report's counts, under the given heading, from its
+// output.
+func countsOf(t *testing.T, out, heading string) map[string]int {
+	t.Helper()
+	m := map[string]int{}
+	i := strings.Index(out, heading+"\n")
+	if i < 0 {
+		return m
+	}
+	for _, line := range strings.Split(out[i+len(heading)+1:], "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 || !strings.HasPrefix(line, "  ") {
+			break
+		}
+		n, err := strconv.Atoi(f[1])
+		if err != nil {
+			break
+		}
+		m[f[0]] = n
+	}
+	return m
+}
+
+// The plan is the restore it describes: run against the same target, the real
+// restore restores and skips exactly what the plan said, and the plan itself
+// changes nothing. Checked for an empty target and for --merge skip into a
+// target missing some of the backup.
+func TestCLIPlanMatchesTheRestore(t *testing.T) {
+	a := startNG(t, "acme")
+	seed(t, a)
+	seedPolicies(t, a)
+	seedExtras(t, a)
+	env := cliEnv{t, t.TempDir()}
+	file := filepath.Join(env.dir, "chef.csb")
+	if code, out := env.run("backup", "--server", a.url, "--user", a.admin, "--key", env.key("a", a), "-o", file); code != 0 {
+		t.Fatalf("backup = %d:\n%s", code, out)
+	}
+	b := startNG(t, "unused")
+	target := []string{file, "--server", b.url, "--user", b.admin, "--key", env.key("b", b)}
+	ctx := context.Background()
+	cb := b.client(t, "")
+
+	check := func(name string, extra ...string) {
+		t.Helper()
+		plan, code, out := env.planOf(append(append([]string{}, target...), extra...)...)
+		if code != 0 {
+			t.Fatalf("%s: plan = %d:\n%s", name, code, out)
+		}
+		code, out = env.run(append(append([]string{"restore"}, target...), extra...)...)
+		if code != 0 {
+			t.Fatalf("%s: restore = %d:\n%s", name, code, out)
+		}
+		restored, skipped := countsOf(t, out, "restored"), countsOf(t, out, "already on the target, left as it was")
+		// Files: into an empty org the plan counts each once, while a real run
+		// counts each time a sandbox asks for it, so concurrent versions sharing
+		// one may count it twice. Into an org the target already has, the plan
+		// can't see which the target holds, so it's an upper bound.
+		if len(extra) == 0 && restored["files"] < plan["restore"]["files"] ||
+			len(extra) > 0 && restored["files"] > plan["restore"]["files"] {
+			t.Errorf("%s: restored %d files, planned %d", name, restored["files"], plan["restore"]["files"])
+		}
+		delete(restored, "files")
+		delete(plan["restore"], "files")
+		if !reflect.DeepEqual(restored, plan["restore"]) {
+			t.Errorf("%s: restored %v\n planned %v", name, restored, plan["restore"])
+		}
+		if len(skipped) > 0 || len(plan["skip"]) > 0 {
+			if !reflect.DeepEqual(skipped, plan["skip"]) {
+				t.Errorf("%s: skipped %v\n planned %v", name, skipped, plan["skip"])
+			}
+		}
+	}
+
+	// The plan changes nothing.
+	if _, code, out := env.planOf(target...); code != 0 {
+		t.Fatalf("plan = %d:\n%s", code, out)
+	}
+	if _, _, err := cb.Do(ctx, "GET", "/organizations/acme", nil); err == nil {
+		t.Fatal("the plan created org acme on the target")
+	}
+
+	check("empty target")
+
+	// Lose part of it; plan and rerun with --merge skip.
+	for _, p := range []string{"/organizations/acme/nodes/web01", "/organizations/acme/data/secrets/db", "/organizations/acme/cookbooks/nginx/1.1.0", "/organizations/acme/clients/db01"} {
+		if _, _, err := cb.Do(ctx, "DELETE", p, nil); err != nil {
+			t.Fatalf("DELETE %s: %v", p, err)
+		}
+	}
+	check("--merge skip", "--merge", "skip")
+}
+
+// A plan lists every reason the restore would refuse to start, exits 1, and
+// still shows what it would do were they allowed.
+func TestCLIPlanReportsConflicts(t *testing.T) {
+	a := startNG(t, "acme")
+	seed(t, a)
+	env := cliEnv{t, t.TempDir()}
+	file := filepath.Join(env.dir, "chef.csb")
+	if code, out := env.run("backup", "--server", a.url, "--user", a.admin, "--key", env.key("a", a), "-o", file); code != 0 {
+		t.Fatalf("backup = %d:\n%s", code, out)
+	}
+	b := startNG(t, "acme")
+	_, code, out := env.planOf(file, "--server", b.url, "--user", b.admin, "--key", env.key("b", b))
+	if code != 1 || !strings.Contains(out, "would refuse to start") || !strings.Contains(out, "organization acme") ||
+		!strings.Contains(out, "plan: would restore") {
+		t.Fatalf("plan into a target with acme = %d, want 1 naming the conflict after the plan:\n%s", code, out)
+	}
+}
+
+// --dangling fail under --plan is a reason to refuse, listed with the plan,
+// not an error before it.
+func TestCLIPlanDanglingFail(t *testing.T) {
+	env := cliEnv{t, t.TempDir()}
+	file := filepath.Join(env.dir, "dangling.csb")
+	if err := os.WriteFile(file, danglingBytes(t), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b := startNG(t, "unused")
+	_, code, out := env.planOf(file, "--server", b.url, "--user", b.admin, "--key", env.key("b", b), "--dangling", "fail")
+	if code != 1 || !strings.Contains(out, "3 users, clients or groups it doesn't hold (--dangling fail)") ||
+		!strings.Contains(out, "would leave out (3)") {
+		t.Fatalf("plan --dangling fail = %d, want 1 listing the 3 names and the reason:\n%s", code, out)
+	}
+	if _, _, err := b.client(t, "").Do(context.Background(), "GET", "/organizations/acme", nil); err == nil {
+		t.Fatal("the plan created org acme")
 	}
 }

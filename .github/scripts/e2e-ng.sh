@@ -77,6 +77,12 @@ echo "== backing up the source"
 "$csb" verify "$work/source.csb"
 "$csb" inspect "$work/source.csb"
 
+echo "== planning the restore"
+# The restore below refuses a target that already has the backup's orgs or
+# users, so it also proves the plan changed nothing.
+"$csb" restore "$work/source.csb" --server "http://127.0.0.1:$dst_port" --key "$work/keys/dst.pem" \
+  --plan --plan-out "$work/plan.json"
+
 echo "== restoring into the target"
 "$csb" restore "$work/source.csb" --server "http://127.0.0.1:$dst_port" --key "$work/keys/dst.pem"
 

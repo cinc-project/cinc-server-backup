@@ -187,7 +187,20 @@ func (r *Report) skip(kind string) { r.mu.Lock(); r.Skipped[kind]++; r.mu.Unlock
 
 // write sends a create. With MergeSkip, a 409 (the target already has it) is
 // counted as skipped instead of failing; created says which happened.
-func (rs *restorer) write(ctx context.Context, kind, method, p string, body []byte) (created bool, err error) {
+//
+// A dry run can't learn from a 409, so it asks has (whether the target already
+// holds the object) and counts the skip from that instead.
+func (rs *restorer) write(ctx context.Context, kind, method, p string, body []byte, has func(context.Context) (bool, error)) (created bool, err error) {
+	if rs.dry && has != nil {
+		ok, err := has(ctx)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			rs.rep.skip(kind)
+			return false, nil
+		}
+	}
 	_, err = rs.do(ctx, method, p, body, "1")
 	if err != nil && rs.merge == MergeSkip && errors.Is(err, cinc.ErrConflict) {
 		rs.rep.skip(kind)
