@@ -11,7 +11,7 @@ It replaces knife-ec-backup. You'll want it when you need to:
 - **pull one organization out** of a server, into a server of its own;
 - **check a server against a backup** to see whether anything is missing or has changed.
 
-> **Status:** everything below works today over the server's API. Still to come: carrying user passwords and server-admins across (they need access to the server's database), and making a server match a backup by overwriting or deleting what it holds. See [What isn't carried over yet](#what-isnt-carried-over-yet).
+> **Status:** everything below works today over the server's API. Still to come: carrying user passwords and server-admins across (they need access to the server's database), and deleting what a server holds that the backup doesn't. See [What isn't carried over yet](#what-isnt-carried-over-yet).
 
 ## Contents
 
@@ -21,6 +21,7 @@ It replaces knife-ec-backup. You'll want it when you need to:
 - [Move to a new server](#move-to-a-new-server)
 - [Restore one organization](#restore-one-organization)
 - [Restore into a server that already has data](#restore-into-a-server-that-already-has-data)
+- [Make a server match a backup again](#make-a-server-match-a-backup-again)
 - [Preview a restore](#preview-a-restore)
 - [Check a server against a backup](#check-a-server-against-a-backup)
 - [See what changed between two backups](#see-what-changed-between-two-backups)
@@ -225,6 +226,26 @@ already on the target, left as it was
 
 The check at the end still compares everything against the backup. So if the server holds something differently from the backup, such as a role someone edited, it shows up under differences and the run exits 1. That's how you find out what `--merge skip` didn't change.
 
+## Make a server match a backup again
+
+`--merge skip` never changes what's already there. `--merge overwrite` does: **everything in the backup that the server holds differently is made to match the backup.** Use it to bring a server restored earlier back in line, for example a final sync from the old server just before you switch over:
+
+```sh
+cinc-server-backup restore final.csb --server https://new-chef.example.com --key pivotal.pem --merge overwrite --plan
+cinc-server-backup restore final.csb --server https://new-chef.example.com --key pivotal.pem --merge overwrite
+```
+
+- **Users' and clients' details, organizations, nodes, roles, environments, data bag items and cookbook versions** that differ are replaced with the backup's. Each is compared the way `verify` compares, so anything that already matches isn't written.
+- **Group memberships, permissions and policy group assignments** are set to exactly the backup's. Members, entries and assignments the backup doesn't have are removed.
+- **Frozen cookbook versions** are kept, with a `merge.frozen_kept` warning, unless you add `--force-frozen`. Even then, a server never unfreezes a version, so it stays frozen with the backup's content (`merge.stays_frozen`).
+- **What's left alone:**
+  - objects the backup doesn't have (deleting those is still to come);
+  - cookbook artifacts and policy revisions, which can't change under their identifier;
+  - users' keys and passwords;
+  - a same-named user or client that isn't the backup's (see above).
+
+The report lists what was overwritten. Run `--plan` first: it shows exactly what would be overwritten, as the run itself would decide it.
+
 ## Preview a restore
 
 Add `--plan` to any `restore` to see what it would do, without changing anything on the server:
@@ -346,7 +367,7 @@ These need access to the server's database, not just its API, and are planned ne
 
 Also planned:
 
-- **Making a server match a backup** by overwriting objects it holds differently (`--merge overwrite`) and deleting ones the backup doesn't have (`--prune`). `--merge skip` only adds.
+- **Deleting what the backup doesn't have** (`--prune`). `--merge overwrite` makes everything in the backup match, but leaves anything else on the server alone.
 - **Resuming a restore** from where it stopped, without re-reading the server. `--merge skip` already finishes a stopped restore; a journal would make that faster.
 
 ## Keeping backups safe

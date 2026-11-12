@@ -22,13 +22,13 @@ func TestParseDangling(t *testing.T) {
 }
 
 func TestParseMerge(t *testing.T) {
-	for _, s := range []string{"", "skip"} {
+	for _, s := range []string{"", "skip", "overwrite"} {
 		if _, err := ParseMerge(s); err != nil {
 			t.Errorf("ParseMerge(%q): %v", s, err)
 		}
 	}
-	if _, err := ParseMerge("overwrite"); err == nil {
-		t.Error("ParseMerge(overwrite) accepted; it isn't implemented")
+	if _, err := ParseMerge("replace"); err == nil {
+		t.Error("ParseMerge(replace) accepted")
 	}
 }
 

@@ -340,3 +340,18 @@ func sortedJSON(v any) []string {
 	sort.Strings(out)
 	return out
 }
+
+// Equal reports whether a and b, two copies of the object stored at path p in
+// a backup (one perhaps read from a live server), hold the same thing once the
+// values a server regenerates are set aside, as Backups compares them.
+func Equal(p string, a, b []byte) (bool, error) {
+	na, err := normalize(p, a)
+	if err != nil {
+		return false, err
+	}
+	nb, err := normalize(p, b)
+	if err != nil {
+		return false, err
+	}
+	return reflect.DeepEqual(na, nb), nil
+}

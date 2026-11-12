@@ -239,6 +239,7 @@ type restoreFlags struct {
 	merge             string
 	plan              bool
 	planOut           string
+	forceFrozen       bool
 }
 
 func newRestoreCmd() *cobra.Command {
@@ -275,6 +276,16 @@ and permissions the target already has gain the backup's members and entries
 they lack; none are removed. The check at the end then reports anything the
 target holds differently from the backup.
 
+--merge overwrite goes further: everything in the backup that the target holds
+differently is made to match it. Users' and clients' details, orgs, nodes,
+roles, environments, data bag items and cookbook versions are replaced; groups,
+permissions and policy group assignments are set to exactly the backup's.
+Objects are compared as verify compares them, so one that already matches is
+not written. A frozen cookbook version is kept, with a warning, unless you add
+--force-frozen. Objects the backup doesn't have are left alone, and so is a
+same-named user or client that isn't the backup's (different keys or login).
+Use --plan first to see what it would overwrite.
+
 --plan shows what the restore would do and changes nothing: what it would
 restore, what it would leave as it is, what it would leave out, and anything
 that would make it refuse to start. It reads the target to decide, so the
@@ -301,6 +312,10 @@ cinc-server-backup restore chef.csb --server https://new-chef.example.com --key 
 See what a restore would do first, without changing anything.
 cinc-server-backup restore chef.csb --server https://new-chef.example.com --key pivotal.pem --plan
 
+Make a server that was restored earlier match a newer backup again.
+cinc-server-backup restore chef.csb --server https://new-chef.example.com --key pivotal.pem --merge overwrite --plan
+cinc-server-backup restore chef.csb --server https://new-chef.example.com --key pivotal.pem --merge overwrite
+
 Restore a second organization into a server that already has users it shares.
 cinc-server-backup restore chef.csb --server https://new-chef.example.com --key pivotal.pem --org beta --merge skip
 
@@ -319,7 +334,8 @@ cinc-server-backup restore chef.csb --server https://new-chef.example.com --key 
 	fl.BoolVar(&f.noVerify, "no-verify", false, "don't back the target up and compare it with the backup afterwards")
 	fl.BoolVar(&f.plan, "plan", false, "show what the restore would do, and change nothing")
 	fl.StringVar(&f.planOut, "plan-out", "", "with --plan, also write the plan as JSON to this file")
-	fl.StringVar(&f.merge, "merge", "", "restore into a server that already holds some of the backup: skip keeps what it has and adds what's missing")
+	fl.StringVar(&f.merge, "merge", "", "restore into a server that already holds some of the backup: skip keeps what it has and adds what's missing; overwrite also makes what it has match the backup")
+	fl.BoolVar(&f.forceFrozen, "force-frozen", false, "with --merge overwrite, also replace frozen cookbook versions")
 	orgFlags(fl, &f.orgs, &f.excludeOrgs)
 	return cmd
 }
@@ -332,6 +348,9 @@ func runRestore(cmd *cobra.Command, file string, f restoreFlags) error {
 	merge, err := restore.ParseMerge(f.merge)
 	if err != nil {
 		return usagef("%v", err)
+	}
+	if f.forceFrozen && merge != restore.MergeOverwrite {
+		return usagef("--force-frozen needs --merge overwrite")
 	}
 	if f.planOut != "" && !f.plan {
 		return usagef("--plan-out needs --plan")
@@ -370,7 +389,7 @@ func runRestore(cmd *cobra.Command, file string, f restoreFlags) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
 	defer stop()
 	rep, err := restore.ToAPI(ctx, r, c, restore.Options{
-		Concurrency: f.concurrency, Dangling: dangling, Orgs: sel.Orgs, Merge: merge, DryRun: f.plan,
+		Concurrency: f.concurrency, Dangling: dangling, Orgs: sel.Orgs, Merge: merge, DryRun: f.plan, ForceFrozen: f.forceFrozen,
 	})
 	if rep != nil {
 		printReport(out, rep, f.plan)
@@ -397,7 +416,7 @@ var errRefused = errors.New("the restore would refuse to start")
 func finishPlan(out io.Writer, rep *restore.Report, path string) error {
 	if path != "" {
 		data, err := json.MarshalIndent(map[string]any{
-			"conflicts": nonNil(rep.Conflicts), "restore": rep.Restored, "skip": rep.Skipped,
+			"conflicts": nonNil(rep.Conflicts), "restore": rep.Restored, "overwrite": rep.Updated, "skip": rep.Skipped,
 			"left_out": rep.Warnings, "writes": rep.Writes,
 		}, "", "  ")
 		if err != nil {
@@ -442,9 +461,9 @@ func printReport(out io.Writer, rep *restore.Report, planned bool) {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	head, skipHead, leftHead := "restored", "already on the target, left as it was", "left out"
+	head, updHead, skipHead, leftHead := "restored", "overwritten to match the backup", "already on the target, left as it was", "left out"
 	if planned {
-		head, skipHead, leftHead = "plan: would restore", "would leave as it is (already on the target)", "would leave out"
+		head, updHead, skipHead, leftHead = "plan: would restore", "would overwrite to match the backup", "would leave as it is (already on the target)", "would leave out"
 	}
 	fmt.Fprintln(tw, head)
 	for _, k := range keys {
@@ -454,6 +473,17 @@ func printReport(out io.Writer, rep *restore.Report, planned bool) {
 			label = "files (at most)"
 		}
 		fmt.Fprintf(tw, "  %s\t%d\n", label, rep.Restored[k])
+	}
+	if len(rep.Updated) > 0 {
+		fmt.Fprintln(tw, "\n"+updHead)
+		updated := make([]string, 0, len(rep.Updated))
+		for k := range rep.Updated {
+			updated = append(updated, k)
+		}
+		sort.Strings(updated)
+		for _, k := range updated {
+			fmt.Fprintf(tw, "  %s\t%d\n", k, rep.Updated[k])
+		}
 	}
 	if len(rep.Skipped) > 0 {
 		fmt.Fprintln(tw, "\n"+skipHead)
