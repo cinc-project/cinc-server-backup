@@ -19,6 +19,7 @@ import (
 
 	cinc "github.com/cinc-project/cinc-api"
 
+	"github.com/cinc-project/cinc-server-backup/compare"
 	"github.com/cinc-project/cinc-server-backup/format"
 	"github.com/cinc-project/cinc-server-backup/internal/refs"
 )
@@ -43,6 +44,8 @@ type Options struct {
 	// Report.Conflicts rather than failing, and the plan carries on as if
 	// they had been allowed (--merge skip, --dangling drop).
 	DryRun bool
+	// ForceFrozen lets MergeOverwrite replace a frozen cookbook version.
+	ForceFrozen bool
 }
 
 // Report says what a restore did.
@@ -51,8 +54,11 @@ type Report struct {
 	// Restored counts what was written, by kind.
 	Restored map[string]int
 	// Skipped counts what the target already held and was left as it was
-	// (MergeSkip), by kind.
+	// (MergeSkip, or MergeOverwrite where it already matched), by kind.
 	Skipped map[string]int
+	// Updated counts what the target held differently and was made to match
+	// the backup (MergeOverwrite), by kind.
+	Updated map[string]int
 	// Warnings lists what was left out, and why.
 	Warnings []format.Warning
 	// Writes lists the requests a dry run would send, sorted by path.
@@ -90,7 +96,8 @@ func ToAPI(ctx context.Context, r *format.Reader, c *cinc.Client, opts Options) 
 	}
 	rs := &restorer{
 		r: r, c: c, n: n, super: c.ClientName(), merge: opts.Merge, track: newTracker(), dry: opts.DryRun,
-		rep: &Report{Restored: map[string]int{}, Skipped: map[string]int{}},
+		forceFrozen: opts.ForceFrozen,
+		rep:         &Report{Restored: map[string]int{}, Skipped: map[string]int{}, Updated: map[string]int{}},
 	}
 	sel, err := refs.Select(r, opts.Orgs, opts.ExcludeOrgs)
 	if err != nil {
@@ -148,6 +155,8 @@ type restorer struct {
 	// onTarget lists the orgs and users the target held before this run.
 	onTarget map[string]bool
 	dry      bool
+	// forceFrozen lets an overwrite replace a frozen cookbook version.
+	forceFrozen bool
 	// planned counts, per org, the cookbook files a dry run would upload.
 	planned sync.Map
 }
@@ -266,14 +275,14 @@ func (rs *restorer) preflight(ctx context.Context, orgs, users []string) error {
 			return err
 		}
 	}
-	if len(clash) > 0 && rs.merge != MergeSkip && rs.dry {
+	if len(clash) > 0 && !rs.merging() && rs.dry {
 		for _, c := range clash {
 			rs.rep.conflict("the target already has " + c + " (--merge skip would keep it)")
 		}
 		rs.merge = MergeSkip // plan the rest as --merge skip would run it
 		return nil
 	}
-	if len(clash) > 0 && rs.merge != MergeSkip {
+	if len(clash) > 0 && !rs.merging() {
 		return fmt.Errorf("the target already has %s; restore needs a server without them, or --merge skip to keep what it has and add the rest", strings.Join(clash, ", "))
 	}
 	return nil
@@ -321,7 +330,7 @@ func (rs *restorer) extraKeys(ctx context.Context, dir, base, kind string) error
 func (rs *restorer) user(ctx context.Context, u string) error {
 	dir := "server/users/" + u
 	if rs.onTarget["user "+u] {
-		rs.rep.skip("users") // its keys and password stay the target's
+		// Its keys and password stay the target's either way.
 		same, err := rs.sameActor(ctx, "/users/"+esc(u), dir)
 		if err != nil {
 			return err
@@ -335,8 +344,22 @@ func (rs *restorer) user(ctx context.Context, u string) error {
 			rs.track.stranger("users/" + u)
 			rs.rep.warn(format.Warning{Code: "merge.different_user", Path: dir + ".json",
 				Detail: "the target's user " + u + " has a different key, so it gets none of the backup's memberships or permissions"})
+			rs.rep.skip("users")
+			return nil
 		}
-		return nil
+		if !rs.overwriting() {
+			rs.rep.skip("users")
+			return nil
+		}
+		doc, err := rs.object(dir + ".json")
+		if err != nil {
+			return err
+		}
+		for _, k := range []string{"public_key", "chef_key", "create_key", "uri", "private_key", "password"} {
+			delete(doc, k)
+		}
+		body, _ := json.Marshal(doc)
+		return rs.replace(ctx, "users", replacement{url: "/users/" + esc(u), path: dir + ".json", body: body})
 	}
 	doc, err := rs.object(dir + ".json")
 	if err != nil {
@@ -370,7 +393,12 @@ func (rs *restorer) org(ctx context.Context, o string) error {
 	if err != nil {
 		return err
 	}
-	if rs.onTarget["organization "+o] {
+	if rs.onTarget["organization "+o] && rs.overwriting() {
+		body, _ := json.Marshal(map[string]any{"name": o, "full_name": doc["full_name"]})
+		if err := rs.replace(ctx, "orgs", replacement{url: "/organizations/" + esc(o), path: "orgs/" + o + "/org.json", body: body}); err != nil {
+			return err
+		}
+	} else if rs.onTarget["organization "+o] {
 		rs.rep.skip("orgs")
 	} else {
 		body, _ := json.Marshal(map[string]any{"name": o, "full_name": doc["full_name"]})
@@ -395,7 +423,7 @@ func (rs *restorer) org(ctx context.Context, o string) error {
 				continue
 			}
 			b, _ := json.Marshal(map[string]string{"username": m.User.Username})
-			if ok, err := rs.write(ctx, "members", "POST", base+"/users", b, rs.at(o, base+"/users/"+esc(m.User.Username))); err != nil {
+			if ok, err := rs.write(ctx, "members", "POST", base+"/users", b, rs.at(o, base+"/users/"+esc(m.User.Username)), nil); err != nil {
 				return err
 			} else if ok {
 				rs.rep.add("members")
@@ -415,7 +443,7 @@ func (rs *restorer) org(ctx context.Context, o string) error {
 				continue
 			}
 			b, _ := json.Marshal(map[string]string{"user": inv.Username})
-			if ok, err := rs.write(ctx, "invitations", "POST", base+"/association_requests", b, func(ctx context.Context) (bool, error) { return rs.invited(ctx, o, inv.Username) }); err != nil {
+			if ok, err := rs.write(ctx, "invitations", "POST", base+"/association_requests", b, func(ctx context.Context) (bool, error) { return rs.invited(ctx, o, inv.Username) }, nil); err != nil {
 				return err
 			} else if ok {
 				rs.rep.add("invitations")
@@ -498,7 +526,7 @@ func (rs *restorer) clients(ctx context.Context, o string) error {
 		}
 		cbase := base + "/" + esc(name)
 		if have[name] && !rs.track.newOrg(o) {
-			rs.rep.skip("clients") // it and its keys stay the target's
+			// Its keys stay the target's either way.
 			same, err := rs.sameActor(ctx, cbase, dir)
 			if err != nil {
 				return err
@@ -508,7 +536,16 @@ func (rs *restorer) clients(ctx context.Context, o string) error {
 				rs.rep.warn(format.Warning{Code: "merge.different_client", Path: dir + ".json",
 					Detail: "the target's client " + name + " has a different key, so it gets none of the backup's memberships or permissions"})
 			}
-			return nil
+			if !same || !rs.overwriting() {
+				rs.rep.skip("clients")
+				return nil
+			}
+			body := map[string]any{"name": name}
+			if v, ok := doc["validator"]; ok {
+				body["validator"] = v
+			}
+			b, _ := json.Marshal(body)
+			return rs.replace(ctx, "clients", replacement{url: cbase, path: dir + ".json", body: b})
 		}
 		if have[name] {
 			// Created with the org (the validator): put back its key, so
@@ -598,6 +635,27 @@ func (rs *restorer) groups(ctx context.Context, o string) error {
 		users, clients, groups, _ := rs.refs.Members(o, doc)
 		users = rs.withoutStrangers(o, "users", users)
 		clients = rs.withoutStrangers(o, "clients", clients)
+		if !rs.track.created(o, "groups", g) && rs.overwriting() {
+			// Exactly the backup's members, with the target's own per-user
+			// groups kept, written only if that differs from what it has.
+			for _, sub := range stringsOf(target["groups"]) {
+				if usag.MatchString(sub) {
+					groups = append(groups, sub)
+				}
+			}
+			haveUsers := append(stringsOf(target["users"]), rs.joined(o, g, "users")...)
+			haveClients := append(stringsOf(target["clients"]), rs.joined(o, g, "clients")...)
+			if sameSet(haveUsers, users) && sameSet(haveClients, clients) && sameSet(stringsOf(target["groups"]), groups) {
+				rs.rep.skip("groups")
+				return nil
+			}
+			b, _ := json.Marshal(map[string]any{"groupname": g, "actors": map[string]any{"users": users, "clients": clients, "groups": groups}})
+			if _, err := rs.do(ctx, "PUT", base+"/"+esc(g), b, "1"); err != nil {
+				return err
+			}
+			rs.rep.update("groups")
+			return nil
+		}
 		if !rs.track.created(o, "groups", g) {
 			// The target's group: add the backup's members it lacks.
 			var cu, cc, cg bool
@@ -641,7 +699,8 @@ func (rs *restorer) plainObjects(ctx context.Context, o string) error {
 			if err != nil {
 				return err
 			}
-			if ok, err := rs.write(ctx, coll, "POST", base, data, rs.at(o, base+"/"+esc(n))); err != nil || !ok {
+			if ok, err := rs.write(ctx, coll, "POST", base, data, rs.at(o, base+"/"+esc(n)),
+				&replacement{url: base + "/" + esc(n), path: p, body: data}); err != nil || !ok {
 				return err
 			}
 			rs.track.madeObject(o, coll, n)
@@ -658,18 +717,20 @@ func (rs *restorer) dataBags(ctx context.Context, o string) error {
 	base := "/organizations/" + esc(o) + "/data"
 	return rs.each(ctx, rs.names("orgs/"+o+"/data_bags/"), func(ctx context.Context, bag string) error {
 		b, _ := json.Marshal(map[string]string{"name": bag})
-		if ok, err := rs.write(ctx, "data_bags", "POST", base, b, rs.at(o, base+"/"+esc(bag))); err != nil {
+		if ok, err := rs.write(ctx, "data_bags", "POST", base, b, rs.at(o, base+"/"+esc(bag)), nil); err != nil {
 			return err
 		} else if ok {
 			rs.track.madeObject(o, "data", bag)
 			rs.rep.add("data_bags")
 		}
 		for _, item := range rs.names("orgs/" + o + "/data_bags/" + bag + "/") {
-			data, err := rs.r.Object("orgs/" + o + "/data_bags/" + bag + "/" + item + ".json")
+			ip := "orgs/" + o + "/data_bags/" + bag + "/" + item + ".json"
+			data, err := rs.r.Object(ip)
 			if err != nil {
 				return err
 			}
-			if ok, err := rs.write(ctx, "data_bag_items", "POST", base+"/"+esc(bag), data, rs.at(o, base+"/"+esc(bag)+"/"+esc(item))); err != nil {
+			if ok, err := rs.write(ctx, "data_bag_items", "POST", base+"/"+esc(bag), data, rs.at(o, base+"/"+esc(bag)+"/"+esc(item)),
+				&replacement{url: base + "/" + esc(bag) + "/" + esc(item), path: ip, body: data}); err != nil {
 				return err
 			} else if ok {
 				rs.rep.add("data_bag_items")
@@ -712,17 +773,43 @@ func (rs *restorer) manifests(ctx context.Context, o, coll, kind string) error {
 	return rs.each(ctx, rs.versions(o, coll), func(ctx context.Context, nv string) error {
 		cb, ver := path.Split(nv)
 		cb = strings.TrimSuffix(cb, "/")
-		if have[cb][ver] {
+		p := "orgs/" + o + "/" + coll + "/" + nv + ".json"
+		e, _ := rs.r.Entry(p)
+		target := org + "/" + coll + "/" + esc(cb) + "/" + esc(ver)
+		exists := have[cb][ver]
+		// An artifact can't change under its identifier, so it is never
+		// overwritten; a cookbook version is, when it differs.
+		if exists && (!rs.overwriting() || coll != "cookbooks") {
 			rs.rep.skip(kind)
 			return nil
 		}
 		if _, ok := have[cb]; !ok {
 			rs.track.madeObject(o, coll, cb) // the ACL is per name
 		}
-		p := "orgs/" + o + "/" + coll + "/" + nv + ".json"
 		data, err := rs.r.Object(p)
 		if err != nil {
 			return err
+		}
+		if exists {
+			cur, err := rs.do(ctx, "GET", target, nil, e.APIVersion)
+			if err != nil {
+				return err
+			}
+			same, err := compare.Equal(p, data, cur)
+			if err != nil {
+				return fmt.Errorf("%s: %w", p, err)
+			}
+			if same {
+				rs.rep.skip(kind)
+				return nil
+			}
+			if rs.forceFrozen && frozen(cur) && !frozen(data) {
+				// erchef never clears "frozen?" once set, force or not
+				// (chef_wm_cookbook_version), so the content can be replaced
+				// but the version stays frozen.
+				rs.rep.warn(format.Warning{Code: "merge.stays_frozen", Path: p,
+					Detail: "the target's " + cb + " " + ver + " is frozen; its content is replaced, but a server never unfreezes a version"})
+			}
 		}
 		files, err := format.ManifestFiles(data)
 		if err != nil {
@@ -735,13 +822,24 @@ func (rs *restorer) manifests(ctx context.Context, o, coll, kind string) error {
 		if err != nil {
 			return fmt.Errorf("%s: %w", p, err)
 		}
-		name, version := path.Split(nv)
-		e, _ := rs.r.Entry(p)
-		target := org + "/" + coll + "/" + esc(strings.TrimSuffix(name, "/")) + "/" + esc(version)
-		if _, err := rs.do(ctx, "PUT", target, body, e.APIVersion); err != nil {
+		put := target
+		if exists && rs.forceFrozen {
+			put += "?force=true" // replace it even if frozen
+		}
+		if _, err := rs.do(ctx, "PUT", put, body, e.APIVersion); err != nil {
+			if exists && errors.Is(err, cinc.ErrConflict) {
+				rs.rep.warn(format.Warning{Code: "merge.frozen_kept", Path: p,
+					Detail: "the target's " + cb + " " + ver + " is frozen and differs; --force-frozen replaces it"})
+				rs.rep.skip(kind)
+				return nil
+			}
 			return err
 		}
-		rs.rep.add(kind)
+		if exists {
+			rs.rep.update(kind)
+		} else {
+			rs.rep.add(kind)
+		}
 		return nil
 	})
 }
@@ -832,7 +930,9 @@ func (rs *restorer) policies(ctx context.Context, o string) error {
 	revs := rs.versions(o, "policies")
 	// What the target already has, so its policies' ACLs and its groups'
 	// assignments are added to rather than replaced.
-	havePolicies, haveGroups := map[string]bool{}, map[string]map[string]bool{}
+	// haveGroups maps each target policy group to its assignments: policy
+	// name -> revision id.
+	havePolicies, haveGroups := map[string]bool{}, map[string]map[string]string{}
 	if !rs.track.newOrg(o) {
 		pl, err := rs.listing(ctx, org+"/policies")
 		if err != nil {
@@ -847,12 +947,14 @@ func (rs *restorer) policies(ctx context.Context, o string) error {
 		}
 		for g, raw := range gl {
 			var entry struct {
-				Policies map[string]json.RawMessage `json:"policies"`
+				Policies map[string]struct {
+					RevisionID string `json:"revision_id"`
+				} `json:"policies"`
 			}
 			_ = json.Unmarshal(raw, &entry)
-			haveGroups[g] = map[string]bool{}
-			for n := range entry.Policies {
-				haveGroups[g][n] = true
+			haveGroups[g] = map[string]string{}
+			for n, ref := range entry.Policies {
+				haveGroups[g][n] = ref.RevisionID
 			}
 		}
 	}
@@ -863,7 +965,7 @@ func (rs *restorer) policies(ctx context.Context, o string) error {
 		}
 		name, rev := path.Split(pr)
 		name = strings.TrimSuffix(name, "/")
-		if ok, err := rs.write(ctx, "policy_revisions", "POST", org+"/policies/"+esc(name)+"/revisions", data, rs.at(o, org+"/policies/"+esc(name)+"/revisions/"+esc(rev))); err != nil || !ok {
+		if ok, err := rs.write(ctx, "policy_revisions", "POST", org+"/policies/"+esc(name)+"/revisions", data, rs.at(o, org+"/policies/"+esc(name)+"/revisions/"+esc(rev)), nil); err != nil || !ok {
 			return err
 		}
 		if !havePolicies[name] {
@@ -884,14 +986,19 @@ func (rs *restorer) policies(ctx context.Context, o string) error {
 		if !existed {
 			rs.track.madeObject(o, "policy_groups", g)
 		}
-		wrote := !existed
+		wrote, changed := !existed, false
 		for name, v := range pols {
-			if haveGroups[g][name] {
-				continue // keep the target's assignment
-			}
-			wrote = true
 			ref, _ := v.(map[string]any)
 			rev, _ := ref["revision_id"].(string)
+			cur, assigned := haveGroups[g][name]
+			if assigned && (!rs.overwriting() || cur == rev) {
+				continue // keep the target's assignment, or it's already this one
+			}
+			if assigned {
+				changed = true
+			} else {
+				wrote = true
+			}
 			data, err := rs.r.Object("orgs/" + o + "/policies/" + name + "/" + rev + ".json")
 			if err != nil {
 				return fmt.Errorf("policy group %s names %s revision %s: %w", g, name, rev, err)
@@ -900,9 +1007,24 @@ func (rs *restorer) policies(ctx context.Context, o string) error {
 				return err
 			}
 		}
-		if wrote {
+		if existed && rs.overwriting() {
+			// Exactly the backup's assignments: drop the ones it doesn't have.
+			for name := range haveGroups[g] {
+				if _, ok := pols[name]; ok {
+					continue
+				}
+				if _, err := rs.do(ctx, "DELETE", org+"/policy_groups/"+esc(g)+"/policies/"+esc(name), nil, "1"); err != nil {
+					return err
+				}
+				changed = true
+			}
+		}
+		switch {
+		case existed && (changed || wrote) && rs.overwriting():
+			rs.rep.update("policy_groups")
+		case wrote || changed:
 			rs.rep.add("policy_groups")
-		} else {
+		default:
 			rs.rep.skip("policy_groups")
 		}
 		return nil
@@ -935,7 +1057,13 @@ func (rs *restorer) putACL(ctx context.Context, p, base, o string, created bool)
 		}
 		out, _, _ := rs.refs.ACE(o, ace)
 		out = rs.strangersOut(o, out)
-		if !created {
+		switch {
+		case !created && rs.overwriting():
+			// Exactly the backup's entries, written only if they differ.
+			if rs.sameACE(o, target[perm], out) {
+				continue
+			}
+		case !created:
 			var changed bool
 			if out, changed = rs.mergeACE(o, target[perm], out); !changed {
 				continue
@@ -947,9 +1075,14 @@ func (rs *restorer) putACL(ctx context.Context, p, base, o string, created bool)
 		}
 		wrote = true
 	}
-	if created || wrote {
+	switch {
+	case created:
 		rs.rep.add("acls")
-	} else {
+	case wrote && rs.overwriting():
+		rs.rep.update("acls")
+	case wrote:
+		rs.rep.add("acls")
+	default:
 		rs.rep.skip("acls")
 	}
 	return nil

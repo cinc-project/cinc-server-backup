@@ -9,6 +9,8 @@ import (
 	"sync"
 
 	cinc "github.com/cinc-project/cinc-api"
+
+	"github.com/cinc-project/cinc-server-backup/compare"
 )
 
 // Merge says what restore does with what the target already holds.
@@ -24,15 +26,31 @@ const (
 	// and entries the target's copy lacks are added to it, and none are
 	// removed, so the result grants what either one granted.
 	MergeSkip Merge = "skip"
+	// MergeOverwrite makes every object in the backup match the backup on the
+	// target. An object the target holds differently is replaced, compared as
+	// verify compares (values a server regenerates set aside), so one that
+	// already matches isn't written. Groups, ACLs and policy group assignments
+	// are set to exactly the backup's. Artifacts and policy revisions, which
+	// can't change under their identifier, are left as they are, and so is a
+	// frozen cookbook version unless ForceFrozen is set. Objects the backup
+	// doesn't hold are not touched, and neither is a same-named actor that is
+	// someone else (see sameActor).
+	MergeOverwrite Merge = "overwrite"
 )
+
+// merging reports whether the target may already hold what is restored.
+func (rs *restorer) merging() bool { return rs.merge == MergeSkip || rs.merge == MergeOverwrite }
+
+// overwriting reports whether objects the target holds are made to match.
+func (rs *restorer) overwriting() bool { return rs.merge == MergeOverwrite }
 
 // ParseMerge checks a --merge value.
 func ParseMerge(s string) (Merge, error) {
 	switch m := Merge(s); m {
-	case MergeNone, MergeSkip:
+	case MergeNone, MergeSkip, MergeOverwrite:
 		return m, nil
 	}
-	return "", fmt.Errorf("unknown merge mode %q (want skip)", s)
+	return "", fmt.Errorf("unknown merge mode %q (want skip or overwrite)", s)
 }
 
 // tracker records what this run created, so restore can tell an object it
@@ -183,6 +201,8 @@ func (rs *restorer) strangersOut(o string, ace map[string]any) map[string]any {
 	return ace
 }
 
+func (r *Report) update(kind string) { r.mu.Lock(); r.Updated[kind]++; r.mu.Unlock() }
+
 func (r *Report) skip(kind string) { r.mu.Lock(); r.Skipped[kind]++; r.mu.Unlock() }
 
 // write sends a create. With MergeSkip, a 409 (the target already has it) is
@@ -190,23 +210,68 @@ func (r *Report) skip(kind string) { r.mu.Lock(); r.Skipped[kind]++; r.mu.Unlock
 //
 // A dry run can't learn from a 409, so it asks has (whether the target already
 // holds the object) and counts the skip from that instead.
-func (rs *restorer) write(ctx context.Context, kind, method, p string, body []byte, has func(context.Context) (bool, error)) (created bool, err error) {
+//
+// With MergeOverwrite, ow (when not nil) says how to make an existing object
+// match the backup instead of skipping it.
+func (rs *restorer) write(ctx context.Context, kind, method, p string, body []byte, has func(context.Context) (bool, error), ow *replacement) (created bool, err error) {
 	if rs.dry && has != nil {
 		ok, err := has(ctx)
 		if err != nil {
 			return false, err
 		}
 		if ok {
-			rs.rep.skip(kind)
-			return false, nil
+			return false, rs.existed(ctx, kind, ow)
 		}
 	}
 	_, err = rs.do(ctx, method, p, body, "1")
-	if err != nil && rs.merge == MergeSkip && errors.Is(err, cinc.ErrConflict) {
-		rs.rep.skip(kind)
-		return false, nil
+	if err != nil && rs.merging() && errors.Is(err, cinc.ErrConflict) {
+		return false, rs.existed(ctx, kind, ow)
 	}
 	return err == nil, err
+}
+
+// existed handles an object write found already on the target: overwrite it
+// to match the backup, or skip it.
+func (rs *restorer) existed(ctx context.Context, kind string, ow *replacement) error {
+	if rs.overwriting() && ow != nil {
+		return rs.replace(ctx, kind, *ow)
+	}
+	rs.rep.skip(kind)
+	return nil
+}
+
+// replacement says how to make the target's copy of an object match the
+// backup: read url, compare it with the backup's object at path, and PUT body
+// to url if they differ.
+type replacement struct {
+	url, path string
+	body      []byte
+}
+
+// replace makes the target's object match the backup's when it doesn't,
+// counting it as updated, or as skipped when it already matches.
+func (rs *restorer) replace(ctx context.Context, kind string, ow replacement) error {
+	cur, err := rs.do(ctx, "GET", ow.url, nil, "1")
+	if err != nil {
+		return err
+	}
+	want, err := rs.r.Object(ow.path)
+	if err != nil {
+		return err
+	}
+	same, err := compare.Equal(ow.path, want, cur)
+	if err != nil {
+		return fmt.Errorf("%s: %w", ow.path, err)
+	}
+	if same {
+		rs.rep.skip(kind)
+		return nil
+	}
+	if _, err := rs.do(ctx, "PUT", ow.url, ow.body, "1"); err != nil {
+		return err
+	}
+	rs.rep.update(kind)
+	return nil
 }
 
 // union returns a followed by the names of b it lacks, and whether any were
@@ -344,4 +409,51 @@ func (rs *restorer) sameLogin(ctx context.Context, u, dir string) (bool, error) 
 	}
 	uid := func(m map[string]any) string { s, _ := m["external_authentication_uid"].(string); return s }
 	return uid(backup) == uid(target), nil
+}
+
+// sameSet reports whether a and b hold the same names, ignoring order and
+// repeats.
+func sameSet(a, b []string) bool {
+	set := func(l []string) map[string]bool {
+		m := map[string]bool{}
+		for _, n := range l {
+			m[n] = true
+		}
+		return m
+	}
+	sa, sb := set(a), set(b)
+	if len(sa) != len(sb) {
+		return false
+	}
+	for n := range sa {
+		if !sb[n] {
+			return false
+		}
+	}
+	return true
+}
+
+// sameACE reports whether the target's entry for one permission already grants
+// exactly what the backup's (out, as refs.ACE resolved it) does. Untyped backup
+// actors are typed as mergeACE types them.
+func (rs *restorer) sameACE(o string, target, out map[string]any) bool {
+	users, clients := names(out["users"]), names(out["clients"])
+	for _, a := range names(out["actors"]) {
+		if rs.refs.IsUser(a) || o == "" {
+			users = append(users, a)
+		} else {
+			clients = append(clients, a)
+		}
+	}
+	return sameSet(stringsOf(target["users"]), users) &&
+		sameSet(stringsOf(target["clients"]), clients) &&
+		sameSet(stringsOf(target["groups"]), names(out["groups"]))
+}
+
+// frozen reports whether a cookbook manifest has "frozen?" set.
+func frozen(manifest []byte) bool {
+	var m struct {
+		Frozen bool `json:"frozen?"`
+	}
+	return json.Unmarshal(manifest, &m) == nil && m.Frozen
 }

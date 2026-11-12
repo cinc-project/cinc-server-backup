@@ -340,6 +340,12 @@ func TestCLIRestoreMergeSkipRerun(t *testing.T) {
 // else: --merge skip gives it none of the backup's memberships or grants, says
 // so, and the check reports what is missing.
 func TestCLIMergeSkipWithholdsGrantsFromAStranger(t *testing.T) {
+	for _, mode := range []string{"skip", "overwrite"} {
+		t.Run(mode, func(t *testing.T) { testWithholdsGrantsFromAStranger(t, mode) })
+	}
+}
+
+func testWithholdsGrantsFromAStranger(t *testing.T, mode string) {
 	a := startNG(t, "acme")
 	seed(t, a)
 	seedExtras(t, a) // the user alice is in devs and web01's update ACL; a client alice is in its delete ACL
@@ -356,7 +362,7 @@ func TestCLIMergeSkipWithholdsGrantsFromAStranger(t *testing.T) {
 	if _, _, err := cb.Do(ctx, "POST", "/users", []byte(`{"username":"alice","email":"other@example.com","first_name":"O","last_name":"A","display_name":"Other Alice","password":"sekrit123","create_key":true}`)); err != nil {
 		t.Fatal(err)
 	}
-	code, out := env.run("restore", file, "--server", b.url, "--user", b.admin, "--key", env.key("b", b), "--merge", "skip")
+	code, out := env.run("restore", file, "--server", b.url, "--user", b.admin, "--key", env.key("b", b), "--merge", mode)
 	if code != 1 || !strings.Contains(out, "merge.different_user") {
 		t.Fatalf("restore = %d, want 1 with a different_user warning:\n%s", code, out)
 	}
@@ -648,5 +654,108 @@ func TestCLIPlanDanglingFail(t *testing.T) {
 	}
 	if _, _, err := b.client(t, "").Do(context.Background(), "GET", "/organizations/acme", nil); err == nil {
 		t.Fatal("the plan created org acme")
+	}
+}
+
+// --merge overwrite makes a target that drifted from the backup match it again:
+// changed objects are replaced, groups, ACLs and policy group assignments are
+// set back, a frozen cookbook version is kept unless --force-frozen, and the
+// plan shows exactly what the run then overwrites.
+func TestCLIMergeOverwriteMakesTheTargetMatch(t *testing.T) {
+	a := startNG(t, "acme")
+	seed(t, a)
+	seedPolicies(t, a)
+	seedExtras(t, a)
+	env := cliEnv{t, t.TempDir()}
+	file := filepath.Join(env.dir, "chef.csb")
+	if code, out := env.run("backup", "--server", a.url, "--user", a.admin, "--key", env.key("a", a), "-o", file); code != 0 {
+		t.Fatalf("backup = %d:\n%s", code, out)
+	}
+	b := startNG(t, "unused")
+	target := []string{file, "--server", b.url, "--user", b.admin, "--key", env.key("b", b)}
+	if code, out := env.run(append([]string{"restore"}, target...)...); code != 0 {
+		t.Fatalf("restore = %d:\n%s", code, out)
+	}
+
+	// Drift.
+	ctx := context.Background()
+	cb := b.client(t, "")
+	do := func(method, p, body string) []byte {
+		t.Helper()
+		data, _, err := cb.Do(ctx, method, p, []byte(body))
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, p, err)
+		}
+		return data
+	}
+	do("PUT", "/organizations/acme/roles/web", `{"name":"web","json_class":"Chef::Role","chef_type":"role","run_list":["recipe[apache]"]}`)
+	do("PUT", "/organizations/acme/nodes/web01", `{"name":"web01","json_class":"Chef::Node","chef_type":"node","chef_environment":"_default","run_list":[],"normal":{},"automatic":{},"default":{},"override":{}}`)
+	do("PUT", "/organizations/acme/data/secrets/db", `{"id":"db","password":"changed"}`)
+	do("PUT", "/organizations/acme/groups/devs", `{"groupname":"devs","actors":{"users":[],"clients":["db01"],"groups":[]}}`)
+	do("PUT", "/organizations/acme/nodes/web01/_acl/update", `{"update":{"actors":[],"users":[],"clients":[],"groups":["admins"]}}`)
+	do("PUT", "/organizations/acme/policy_groups/prod/policies/web", string(do("GET", "/organizations/acme/policies/web/revisions/"+strings.Repeat("b", 40), "")))
+	user := map[string]any{}
+	_ = json.Unmarshal(do("GET", "/users/alice", ""), &user)
+	user["display_name"] = "Someone Else"
+	ub, _ := json.Marshal(user)
+	do("PUT", "/users/alice", string(ub))
+	// nginx 1.0.0: changed and frozen.
+	var cbk map[string]any
+	_ = json.Unmarshal(do("GET", "/organizations/acme/cookbooks/nginx/1.0.0", ""), &cbk)
+	md, _ := cbk["metadata"].(map[string]any)
+	md["description"] = "changed on the target"
+	cbk["frozen?"] = true
+	cbb, _ := json.Marshal(cbk)
+	do("PUT", "/organizations/acme/cookbooks/nginx/1.0.0?force=true", string(cbb))
+
+	// Overwrite without --force-frozen: everything but the frozen cookbook.
+	code, out := env.run(append(append([]string{"restore"}, target...), "--merge", "overwrite")...)
+	diffs := regexp.MustCompile(`(?m)^(missing|changed)\s+(\S+)`).FindAllStringSubmatch(out, -1)
+	if code != 1 || !strings.Contains(out, "merge.frozen_kept") || len(diffs) != 1 || diffs[0][2] != "orgs/acme/cookbooks/nginx/1.0.0.json" {
+		t.Fatalf("overwrite = %d, want 1 with the frozen cookbook kept as the only difference:\n%s", code, out)
+	}
+	got := countsOf(t, out, "overwritten to match the backup")
+	for _, k := range []string{"roles", "nodes", "data_bag_items", "groups", "acls", "policy_groups", "users"} {
+		if got[k] < 1 {
+			t.Errorf("overwritten %v: no %s", got, k)
+		}
+	}
+	if got["cookbook_versions"] != 0 {
+		t.Errorf("the frozen cookbook was overwritten without --force-frozen: %v", got)
+	}
+
+	// The plan with --force-frozen: only that cookbook is left to overwrite.
+	path := filepath.Join(env.dir, "overwrite-plan.json")
+	if code, out := env.run(append(append([]string{"restore"}, target...), "--merge", "overwrite", "--force-frozen", "--plan", "--plan-out", path)...); code != 0 {
+		t.Fatalf("plan = %d:\n%s", code, out)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plan struct {
+		Overwrite map[string]int `json:"overwrite"`
+	}
+	_ = json.Unmarshal(data, &plan)
+	if !reflect.DeepEqual(plan.Overwrite, map[string]int{"cookbook_versions": 1}) {
+		t.Errorf("planned overwrites = %v, want only the frozen cookbook", plan.Overwrite)
+	}
+
+	// --force-frozen replaces its content. No server ever unfreezes a version
+	// (erchef keeps "frozen?" once set), so that is the one difference left,
+	// and the run says why.
+	code, out = env.run(append(append([]string{"restore"}, target...), "--merge", "overwrite", "--force-frozen")...)
+	diffs = regexp.MustCompile(`(?m)^(missing|changed)\s+(\S+)`).FindAllStringSubmatch(out, -1)
+	if code != 1 || !strings.Contains(out, "merge.stays_frozen") || len(diffs) != 1 || diffs[0][2] != "orgs/acme/cookbooks/nginx/1.0.0.json" {
+		t.Fatalf("overwrite --force-frozen = %d, want 1 with stays_frozen and only the cookbook differing:\n%s", code, out)
+	}
+	if got := countsOf(t, out, "overwritten to match the backup"); !reflect.DeepEqual(got, plan.Overwrite) {
+		t.Errorf("overwritten %v, planned %v", got, plan.Overwrite)
+	}
+	cbk = map[string]any{}
+	_ = json.Unmarshal(do("GET", "/organizations/acme/cookbooks/nginx/1.0.0", ""), &cbk)
+	md, _ = cbk["metadata"].(map[string]any)
+	if md["description"] == "changed on the target" || cbk["frozen?"] != true {
+		t.Errorf("after --force-frozen: description %v, frozen? %v; want the backup's content, still frozen", md["description"], cbk["frozen?"])
 	}
 }
