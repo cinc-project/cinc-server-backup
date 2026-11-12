@@ -46,6 +46,10 @@ type Options struct {
 	DryRun bool
 	// ForceFrozen lets MergeOverwrite replace a frozen cookbook version.
 	ForceFrozen bool
+	// Prune, with MergeOverwrite, also deletes what the restored orgs on the
+	// target hold that the backup doesn't, and on a full restore into a
+	// target with no other orgs, the users it doesn't hold.
+	Prune bool
 }
 
 // Report says what a restore did.
@@ -59,6 +63,11 @@ type Report struct {
 	// Updated counts what the target held differently and was made to match
 	// the backup (MergeOverwrite), by kind.
 	Updated map[string]int
+	// Pruned counts what was deleted because the backup doesn't hold it
+	// (Prune), by kind.
+	Pruned map[string]int
+	// PrunedUsers says whether users were pruned too (see Options.Prune).
+	PrunedUsers bool
 	// Warnings lists what was left out, and why.
 	Warnings []format.Warning
 	// Writes lists the requests a dry run would send, sorted by path.
@@ -96,8 +105,11 @@ func ToAPI(ctx context.Context, r *format.Reader, c *cinc.Client, opts Options) 
 	}
 	rs := &restorer{
 		r: r, c: c, n: n, super: c.ClientName(), merge: opts.Merge, track: newTracker(), dry: opts.DryRun,
-		forceFrozen: opts.ForceFrozen,
-		rep:         &Report{Restored: map[string]int{}, Skipped: map[string]int{}, Updated: map[string]int{}},
+		forceFrozen: opts.ForceFrozen, pruning: opts.Prune,
+		rep: &Report{Restored: map[string]int{}, Skipped: map[string]int{}, Updated: map[string]int{}, Pruned: map[string]int{}},
+	}
+	if opts.Prune && opts.Merge != MergeOverwrite {
+		return nil, errors.New("pruning needs MergeOverwrite: it deletes what the backup doesn't hold, so the rest must match it too")
 	}
 	sel, err := refs.Select(r, opts.Orgs, opts.ExcludeOrgs)
 	if err != nil {
@@ -137,6 +149,9 @@ func ToAPI(ctx context.Context, r *format.Reader, c *cinc.Client, opts Options) 
 	if err := rs.each(ctx, users, rs.userACL); err != nil {
 		return rs.rep, err
 	}
+	if rs.rep.PrunedUsers, err = rs.pruneUsers(ctx); err != nil {
+		return rs.rep, err
+	}
 	sort.Slice(rs.rep.Warnings, func(i, j int) bool { return rs.rep.Warnings[i].Path < rs.rep.Warnings[j].Path })
 	rs.rep.sortWrites()
 	return rs.rep, nil
@@ -157,6 +172,7 @@ type restorer struct {
 	dry      bool
 	// forceFrozen lets an overwrite replace a frozen cookbook version.
 	forceFrozen bool
+	pruning     bool
 	// planned counts, per org, the cookbook files a dry run would upload.
 	planned sync.Map
 }
@@ -476,7 +492,7 @@ func (rs *restorer) existing(ctx context.Context, o, coll, p string) (map[string
 func (rs *restorer) orgContents(ctx context.Context, o string) error {
 	for _, step := range []func(context.Context, string) error{
 		rs.containers, rs.clients, rs.groups, rs.plainObjects, rs.dataBags,
-		rs.cookbooks, rs.artifacts, rs.policies, rs.acls,
+		rs.cookbooks, rs.artifacts, rs.policies, rs.acls, rs.prune,
 	} {
 		if err := step(ctx, o); err != nil {
 			return err

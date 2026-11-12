@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -58,7 +59,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	if errors.Is(err, errDifferent) {
 		return 1 // the command printed what differs
 	}
-	if errors.Is(err, errRefused) {
+	if errors.Is(err, errRefused) || errors.Is(err, errAborted) {
 		return 1 // the plan printed why
 	}
 	if errors.Is(err, errDropped) {
@@ -240,6 +241,7 @@ type restoreFlags struct {
 	plan              bool
 	planOut           string
 	forceFrozen       bool
+	prune, yes        bool
 }
 
 func newRestoreCmd() *cobra.Command {
@@ -285,6 +287,18 @@ not written. A frozen cookbook version is kept, with a warning, unless you add
 --force-frozen. Objects the backup doesn't have are left alone, and so is a
 same-named user or client that isn't the backup's (different keys or login).
 Use --plan first to see what it would overwrite.
+
+--prune, with --merge overwrite, also deletes what the restored organizations
+on the target hold that the backup doesn't: nodes, roles, environments, data
+bags and items, clients, groups, containers, cookbook versions, artifacts,
+policies, policy groups, members and invitations. It never deletes what every
+org comes with (default groups and containers, _default, the validator), the
+superuser restore signs as, or orgs. It deletes users the backup doesn't hold
+only on a full restore into a server with no other orgs. It lists what it
+would delete and asks first, and changes nothing unless you answer yes (so a
+run with no one to answer changes nothing); --yes skips the question, and
+--plan shows the list without changing anything. The check at the end then also reports
+anything the target still holds that the backup doesn't.
 
 --plan shows what the restore would do and changes nothing: what it would
 restore, what it would leave as it is, what it would leave out, and anything
@@ -336,6 +350,8 @@ cinc-server-backup restore chef.csb --server https://new-chef.example.com --key 
 	fl.StringVar(&f.planOut, "plan-out", "", "with --plan, also write the plan as JSON to this file")
 	fl.StringVar(&f.merge, "merge", "", "restore into a server that already holds some of the backup: skip keeps what it has and adds what's missing; overwrite also makes what it has match the backup")
 	fl.BoolVar(&f.forceFrozen, "force-frozen", false, "with --merge overwrite, also replace frozen cookbook versions")
+	fl.BoolVar(&f.prune, "prune", false, "with --merge overwrite, also delete what the restored orgs hold that the backup doesn't")
+	fl.BoolVar(&f.yes, "yes", false, "with --prune, delete without asking")
 	orgFlags(fl, &f.orgs, &f.excludeOrgs)
 	return cmd
 }
@@ -351,6 +367,12 @@ func runRestore(cmd *cobra.Command, file string, f restoreFlags) error {
 	}
 	if f.forceFrozen && merge != restore.MergeOverwrite {
 		return usagef("--force-frozen needs --merge overwrite")
+	}
+	if f.prune && merge != restore.MergeOverwrite {
+		return usagef("--prune needs --merge overwrite: it deletes what the backup doesn't hold, so the rest must match it too")
+	}
+	if f.yes && !f.prune {
+		return usagef("--yes only applies to --prune")
 	}
 	if f.planOut != "" && !f.plan {
 		return usagef("--plan-out needs --plan")
@@ -388,9 +410,17 @@ func runRestore(cmd *cobra.Command, file string, f restoreFlags) error {
 	}
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
 	defer stop()
-	rep, err := restore.ToAPI(ctx, r, c, restore.Options{
-		Concurrency: f.concurrency, Dangling: dangling, Orgs: sel.Orgs, Merge: merge, DryRun: f.plan, ForceFrozen: f.forceFrozen,
-	})
+	opts := restore.Options{
+		Concurrency: f.concurrency, Dangling: dangling, Orgs: sel.Orgs, Merge: merge, DryRun: f.plan,
+		ForceFrozen: f.forceFrozen, Prune: f.prune,
+	}
+	if f.prune && !f.plan && !f.yes {
+		ok, err := confirmPrune(ctx, cmd, r, c, opts)
+		if err != nil || !ok {
+			return err
+		}
+	}
+	rep, err := restore.ToAPI(ctx, r, c, opts)
 	if rep != nil {
 		printReport(out, rep, f.plan)
 	}
@@ -404,7 +434,46 @@ func runRestore(cmd *cobra.Command, file string, f restoreFlags) error {
 		return nil
 	}
 	fmt.Fprintln(out)
-	return checkServer(ctx, out, r, sel, file, f.server, f.user, c, capture.Options{Concurrency: f.concurrency, BlobHosts: f.blobHosts})
+	include := sel.Includes
+	if rep.PrunedUsers {
+		include = func(p string) bool { return strings.HasPrefix(p, "server/users/") || sel.Includes(p) }
+	}
+	return checkServerWith(ctx, out, r, include, f.prune, file, f.server, f.user, c, capture.Options{Concurrency: f.concurrency, BlobHosts: f.blobHosts})
+}
+
+// errAborted is a declined prune: nothing was changed.
+var errAborted = errors.New("nothing was changed")
+
+// confirmPrune plans the restore, lists what it would delete, and asks.
+func confirmPrune(ctx context.Context, cmd *cobra.Command, r *format.Reader, c *cinc.Client, opts restore.Options) (bool, error) {
+	out := cmd.OutOrStdout()
+	opts.DryRun = true
+	plan, err := restore.ToAPI(ctx, r, c, opts)
+	if err != nil {
+		return false, err
+	}
+	var dels []string
+	for _, w := range plan.Writes {
+		if w.Method == "DELETE" {
+			dels = append(dels, w.Path)
+		}
+	}
+	if len(dels) == 0 {
+		return true, nil // nothing to delete, nothing to ask
+	}
+	fmt.Fprintf(out, "--prune would delete %d objects the backup doesn't hold:\n", len(dels))
+	for _, d := range dels {
+		fmt.Fprintf(out, "  %s\n", d)
+	}
+	_, _ = fmt.Fprint(out, "Type yes to restore and delete them: ")
+	// Anything but yes, the end of input included, is no: a run with nobody
+	// to answer changes nothing.
+	line, _ := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
+	if strings.TrimSpace(line) != "yes" {
+		fmt.Fprintln(out, "\nnothing was changed (--yes deletes without asking)")
+		return false, errAborted
+	}
+	return true, nil
 }
 
 // errRefused is a plan's "the restore would refuse to start": exit 1 after
@@ -416,7 +485,7 @@ var errRefused = errors.New("the restore would refuse to start")
 func finishPlan(out io.Writer, rep *restore.Report, path string) error {
 	if path != "" {
 		data, err := json.MarshalIndent(map[string]any{
-			"conflicts": nonNil(rep.Conflicts), "restore": rep.Restored, "overwrite": rep.Updated, "skip": rep.Skipped,
+			"conflicts": nonNil(rep.Conflicts), "restore": rep.Restored, "overwrite": rep.Updated, "delete": rep.Pruned, "skip": rep.Skipped,
 			"left_out": rep.Warnings, "writes": rep.Writes,
 		}, "", "  ")
 		if err != nil {
@@ -461,9 +530,9 @@ func printReport(out io.Writer, rep *restore.Report, planned bool) {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	head, updHead, skipHead, leftHead := "restored", "overwritten to match the backup", "already on the target, left as it was", "left out"
+	head, updHead, delHead, skipHead, leftHead := "restored", "overwritten to match the backup", "deleted (not in the backup)", "already on the target, left as it was", "left out"
 	if planned {
-		head, updHead, skipHead, leftHead = "plan: would restore", "would overwrite to match the backup", "would leave as it is (already on the target)", "would leave out"
+		head, updHead, delHead, skipHead, leftHead = "plan: would restore", "would overwrite to match the backup", "would delete (not in the backup)", "would leave as it is (already on the target)", "would leave out"
 	}
 	fmt.Fprintln(tw, head)
 	for _, k := range keys {
@@ -483,6 +552,17 @@ func printReport(out io.Writer, rep *restore.Report, planned bool) {
 		sort.Strings(updated)
 		for _, k := range updated {
 			fmt.Fprintf(tw, "  %s\t%d\n", k, rep.Updated[k])
+		}
+	}
+	if len(rep.Pruned) > 0 {
+		fmt.Fprintln(tw, "\n"+delHead)
+		pruned := make([]string, 0, len(rep.Pruned))
+		for k := range rep.Pruned {
+			pruned = append(pruned, k)
+		}
+		sort.Strings(pruned)
+		for _, k := range pruned {
+			fmt.Fprintf(tw, "  %s\t%d\n", k, rep.Pruned[k])
 		}
 	}
 	if len(rep.Skipped) > 0 {
@@ -696,6 +776,12 @@ func runVerify(cmd *cobra.Command, file string, f verifyFlags) error {
 // errDifferent if anything differs, errDropped if only dangling names are
 // missing, and nil if the server holds everything.
 func checkServer(ctx context.Context, out io.Writer, r *format.Reader, sel *refs.Selection, file, server, user string, c *cinc.Client, opts capture.Options) error {
+	return checkServerWith(ctx, out, r, sel.Includes, false, file, server, user, c, opts)
+}
+
+// checkServerWith is checkServer comparing the paths include accepts, and
+// with extras, also reporting what only the server holds.
+func checkServerWith(ctx context.Context, out io.Writer, r *format.Reader, include func(string) bool, extras bool, file, server, user string, c *cinc.Client, opts capture.Options) error {
 	tmp, err := os.CreateTemp("", "csb-verify-*.csb") // created 0600
 	if err != nil {
 		return err
@@ -718,7 +804,7 @@ func checkServer(ctx context.Context, out io.Writer, r *format.Reader, sel *refs
 	if err != nil {
 		return err
 	}
-	res, err := compare.Compare(r, live, compare.Options{SkipUsers: []string{user}, Include: sel.Includes})
+	res, err := compare.Compare(r, live, compare.Options{SkipUsers: []string{user}, Include: include, Extras: extras})
 	if err != nil {
 		return err
 	}

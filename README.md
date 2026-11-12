@@ -11,7 +11,7 @@ It replaces knife-ec-backup. You'll want it when you need to:
 - **pull one organization out** of a server, into a server of its own;
 - **check a server against a backup** to see whether anything is missing or has changed.
 
-> **Status:** everything below works today over the server's API. Still to come: carrying user passwords and server-admins across (they need access to the server's database), and deleting what a server holds that the backup doesn't. See [What isn't carried over yet](#what-isnt-carried-over-yet).
+> **Status:** everything below works today over the server's API. Still to come: carrying user passwords and server-admins across (they need access to the server's database). See [What isn't carried over yet](#what-isnt-carried-over-yet).
 
 ## Contents
 
@@ -239,12 +239,34 @@ cinc-server-backup restore final.csb --server https://new-chef.example.com --key
 - **Group memberships, permissions and policy group assignments** are set to exactly the backup's. Members, entries and assignments the backup doesn't have are removed.
 - **Frozen cookbook versions** are kept, with a `merge.frozen_kept` warning, unless you add `--force-frozen`. Even then, a server never unfreezes a version, so it stays frozen with the backup's content (`merge.stays_frozen`).
 - **What's left alone:**
-  - objects the backup doesn't have (deleting those is still to come);
+  - objects the backup doesn't have, unless you add `--prune` (below);
   - cookbook artifacts and policy revisions, which can't change under their identifier;
   - users' keys and passwords;
   - a same-named user or client that isn't the backup's (see above).
 
 The report lists what was overwritten. Run `--plan` first: it shows exactly what would be overwritten, as the run itself would decide it.
+
+### Delete what the backup doesn't have
+
+Add `--prune` to `--merge overwrite` to also **delete what the restored organizations hold that the backup doesn't**, so the server ends up an exact copy. That covers nodes, roles, environments, data bags and items, clients, groups, containers, cookbook versions and artifacts, policies and policy groups, members and invitations.
+
+```sh
+cinc-server-backup restore final.csb --server https://new-chef.example.com --key pivotal.pem --merge overwrite --prune --plan
+cinc-server-backup restore final.csb --server https://new-chef.example.com --key pivotal.pem --merge overwrite --prune
+```
+
+It lists everything it would delete and asks you to type `yes`. Anything else, including a run with no one to answer, changes nothing. `--yes` skips the question for scripts that have reviewed the plan.
+
+It never deletes:
+- what every organization comes with: the default groups and containers, `_default`, the validator;
+- per-user groups;
+- the superuser restore signs as;
+- organizations: an org the backup doesn't have is left alone;
+- anything in organizations outside `--org`.
+
+It deletes **users** only on a full restore into a server that has no organizations except the backup's. Anywhere else, a user may belong to an org this restore doesn't manage.
+
+After a prune, the check at the end also reports anything the server still holds that the backup doesn't, so a prune that missed something fails the run.
 
 ## Preview a restore
 
@@ -367,8 +389,7 @@ These need access to the server's database, not just its API, and are planned ne
 
 Also planned:
 
-- **Deleting what the backup doesn't have** (`--prune`). `--merge overwrite` makes everything in the backup match, but leaves anything else on the server alone.
-- **Resuming a restore** from where it stopped, without re-reading the server. `--merge skip` already finishes a stopped restore; a journal would make that faster.
+- **Resuming a restore** without re-reading the server. `--merge skip` already finishes a stopped restore correctly; a journal would only make that faster.
 
 ## Keeping backups safe
 

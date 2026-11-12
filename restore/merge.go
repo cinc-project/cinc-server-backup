@@ -201,6 +201,8 @@ func (rs *restorer) strangersOut(o string, ace map[string]any) map[string]any {
 	return ace
 }
 
+func (r *Report) pruned(kind string) { r.mu.Lock(); r.Pruned[kind]++; r.mu.Unlock() }
+
 func (r *Report) update(kind string) { r.mu.Lock(); r.Updated[kind]++; r.mu.Unlock() }
 
 func (r *Report) skip(kind string) { r.mu.Lock(); r.Skipped[kind]++; r.mu.Unlock() }

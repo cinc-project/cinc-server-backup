@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	cinc "github.com/cinc-project/cinc-api"
 	"github.com/cinc-project/cinc-server-backup/internal/cli"
 )
 
@@ -757,5 +759,168 @@ func TestCLIMergeOverwriteMakesTheTargetMatch(t *testing.T) {
 	md, _ = cbk["metadata"].(map[string]any)
 	if md["description"] == "changed on the target" || cbk["frozen?"] != true {
 		t.Errorf("after --force-frozen: description %v, frozen? %v; want the backup's content, still frozen", md["description"], cbk["frozen?"])
+	}
+}
+
+// --prune deletes what the restored org on the target holds that the backup
+// doesn't, exactly as the plan said, keeps every org's defaults, and keeps
+// users when the target has orgs the backup doesn't (they may belong there).
+func TestCLIPruneDeletesWhatTheBackupLacks(t *testing.T) {
+	a := startNG(t, "acme")
+	seed(t, a)
+	seedPolicies(t, a)
+	seedExtras(t, a)
+	env := cliEnv{t, t.TempDir()}
+	file := filepath.Join(env.dir, "chef.csb")
+	if code, out := env.run("backup", "--server", a.url, "--user", a.admin, "--key", env.key("a", a), "-o", file); code != 0 {
+		t.Fatalf("backup = %d:\n%s", code, out)
+	}
+	b := startNG(t, "unused")
+	target := []string{file, "--server", b.url, "--user", b.admin, "--key", env.key("b", b)}
+	if code, out := env.run(append([]string{"restore"}, target...)...); code != 0 {
+		t.Fatalf("restore = %d:\n%s", code, out)
+	}
+
+	// Everything the backup doesn't hold.
+	ctx := context.Background()
+	cb := b.client(t, "")
+	post := func(p, body string) {
+		t.Helper()
+		if _, _, err := cb.Do(ctx, "POST", p, []byte(body)); err != nil {
+			t.Fatalf("POST %s: %v", p, err)
+		}
+	}
+	org := "/organizations/acme"
+	post(org+"/nodes", `{"name":"extra01","json_class":"Chef::Node","chef_type":"node","chef_environment":"_default","run_list":[],"normal":{},"automatic":{},"default":{},"override":{}}`)
+	post(org+"/roles", `{"name":"extra","json_class":"Chef::Role","chef_type":"role","run_list":[]}`)
+	post(org+"/environments", `{"name":"staging","json_class":"Chef::Environment","chef_type":"environment"}`)
+	post(org+"/data", `{"name":"extra"}`)
+	post(org+"/data/secrets", `{"id":"extraitem"}`)
+	post(org+"/clients", `{"name":"extra-client"}`)
+	post(org+"/groups", `{"groupname":"extra-group"}`)
+	post(org+"/containers", `{"containername":"extra-container","containerpath":"extra-container"}`)
+	for _, u := range []string{"bob", "carol"} {
+		post("/users", `{"username":"`+u+`","email":"`+u+`@example.com","first_name":"X","last_name":"Y","display_name":"`+u+`","password":"sekrit123"}`)
+	}
+	post(org+"/users", `{"username":"bob"}`)
+	post(org+"/association_requests", `{"user":"carol"}`)
+	rev := strings.Repeat("a", 40)
+	lock, _, err := cb.Do(ctx, "GET", org+"/policies/web/revisions/"+rev, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extraRev := strings.Replace(string(lock), rev, strings.Repeat("c", 40), 1)
+	post(org+"/policies/web/revisions", extraRev)
+	if _, _, err := cb.Do(ctx, "PUT", org+"/policy_groups/staging/policies/web", lock); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(dir, "recipes"), 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "metadata.json"), []byte(`{"name":"nginx","version":"2.0.0"}`), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "recipes", "default.rb"), []byte("log 'extra'\n"), 0o644)
+	cbk, err := cinc.LocalCookbookFromDir(dir, "2.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.client(t, "acme").Cookbooks.Upload(ctx, cbk); err != nil {
+		t.Fatal(err)
+	}
+
+	// The plan lists the deletions and changes nothing.
+	path := filepath.Join(env.dir, "prune-plan.json")
+	if code, out := env.run(append(append([]string{"restore"}, target...), "--merge", "overwrite", "--prune", "--plan", "--plan-out", path)...); code != 0 {
+		t.Fatalf("plan = %d:\n%s", code, out)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plan struct {
+		Delete map[string]int `json:"delete"`
+	}
+	_ = json.Unmarshal(data, &plan)
+	want := map[string]int{
+		"nodes": 1, "roles": 1, "environments": 1, "data_bags": 1, "data_bag_items": 1, "clients": 1,
+		"groups": 1, "containers": 1, "members": 1, "invitations": 1, "cookbook_versions": 1,
+		"policy_revisions": 1, "policy_groups": 1,
+	}
+	if !reflect.DeepEqual(plan.Delete, want) {
+		t.Fatalf("planned deletions = %v, want %v", plan.Delete, want)
+	}
+
+	// Without --yes it asks; with no one to answer, it changes nothing.
+	if code, out := env.run(append(append([]string{"restore"}, target...), "--merge", "overwrite", "--prune")...); code != 1 ||
+		!strings.Contains(out, "would delete 13 objects") || !strings.Contains(out, "nothing was changed") {
+		t.Fatalf("prune without --yes = %d, want 1 listing 13 deletions and changing nothing:\n%s", code, out)
+	}
+	if _, _, err := cb.Do(ctx, "GET", org+"/nodes/extra01", nil); err != nil {
+		t.Fatalf("a refused prune deleted extra01: %v", err)
+	}
+
+	code, out := env.run(append(append([]string{"restore"}, target...), "--merge", "overwrite", "--prune", "--yes")...)
+	if code != 0 {
+		t.Fatalf("prune = %d, want 0:\n%s", code, out)
+	}
+	if got := countsOf(t, out, "deleted (not in the backup)"); !reflect.DeepEqual(got, plan.Delete) {
+		t.Errorf("deleted %v, planned %v", got, plan.Delete)
+	}
+	for _, p := range []string{org + "/nodes/extra01", org + "/roles/extra", org + "/environments/staging", org + "/data/extra",
+		org + "/data/secrets/extraitem", org + "/clients/extra-client", org + "/groups/extra-group", org + "/containers/extra-container",
+		org + "/users/bob", org + "/cookbooks/nginx/2.0.0", org + "/policy_groups/staging", org + "/policies/web/revisions/" + strings.Repeat("c", 40)} {
+		if _, _, err := cb.Do(ctx, "GET", p, nil); !errors.Is(err, cinc.ErrNotFound) {
+			t.Errorf("%s still there after the prune: %v", p, err)
+		}
+	}
+	for _, p := range []string{org + "/environments/_default", org + "/clients/acme-validator", org + "/groups/admins",
+		org + "/containers/nodes", "/users/bob", "/users/carol", "/organizations/unused"} {
+		if _, _, err := cb.Do(ctx, "GET", p, nil); err != nil {
+			t.Errorf("%s was pruned: %v", p, err)
+		}
+	}
+}
+
+// On a full restore into a target with no other orgs, --prune also deletes the
+// users the backup doesn't hold, never the superuser it signs as, and the check
+// then holds the target to the backup's users.
+func TestCLIPruneDeletesUsersOnlyWhenItManagesEveryOrg(t *testing.T) {
+	a := startNG(t, "acme")
+	seed(t, a)
+	// A backup without the source's superuser, so the target's superuser is a
+	// user the backup doesn't hold: only the guard keeps it.
+	data := editBytes(t, backup(t, a), func(p string, data []byte) []byte {
+		if p == "server/users/"+a.admin+".json" || strings.HasPrefix(p, "server/users/"+a.admin+"/") {
+			return nil
+		}
+		return data
+	})
+	env := cliEnv{t, t.TempDir()}
+	file := filepath.Join(env.dir, "chef.csb")
+	if err := os.WriteFile(file, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b := startNG(t, "scratch")
+	ctx := context.Background()
+	cb := b.client(t, "")
+	if _, _, err := cb.Do(ctx, "DELETE", "/organizations/scratch", nil); err != nil {
+		t.Fatal(err) // a target with no orgs but the backup's
+	}
+	target := []string{file, "--server", b.url, "--user", b.admin, "--key", env.key("b", b)}
+	if code, out := env.run(append([]string{"restore"}, target...)...); code != 0 {
+		t.Fatalf("restore = %d:\n%s", code, out)
+	}
+	if _, _, err := cb.Do(ctx, "POST", "/users", []byte(`{"username":"zed","email":"zed@example.com","first_name":"Z","last_name":"Z","display_name":"Zed","password":"sekrit123"}`)); err != nil {
+		t.Fatal(err)
+	}
+	code, out := env.run(append(append([]string{"restore"}, target...), "--merge", "overwrite", "--prune", "--yes")...)
+	if code != 0 || !regexp.MustCompile(`deleted \(not in the backup\)\n\s+users\s+1`).MatchString(out) {
+		t.Fatalf("prune = %d, want 0 deleting one user:\n%s", code, out)
+	}
+	if _, _, err := cb.Do(ctx, "GET", "/users/zed", nil); !errors.Is(err, cinc.ErrNotFound) {
+		t.Errorf("zed survived: %v", err)
+	}
+	for _, u := range []string{"alice", b.admin} {
+		if _, _, err := cb.Do(ctx, "GET", "/users/"+u, nil); err != nil {
+			t.Errorf("%s was pruned: %v", u, err)
+		}
 	}
 }

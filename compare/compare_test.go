@@ -2,6 +2,7 @@ package compare
 
 import (
 	"bytes"
+	"sort"
 	"strings"
 	"testing"
 
@@ -224,5 +225,34 @@ func TestCompareCountsPreservedRegeneratedAndSkipped(t *testing.T) {
 	}
 	if res.Skipped != 2 {
 		t.Errorf("skipped = %d, want 2 (pivotal and the per-user group)", res.Skipped)
+	}
+}
+
+// With Extras, what only the second backup holds is a difference too, within
+// Include; without it, it isn't.
+func TestExtrasAreReportedWhenAsked(t *testing.T) {
+	a := build(t, base)
+	b := build(t, with(map[string]string{
+		"orgs/acme/nodes/extra.json":              `{"name":"extra"}`,
+		"orgs/other/nodes/x.json":                 `{"name":"x"}`,
+		"server/users/stranger.json":              `{"username":"stranger"}`,
+		"orgs/acme/groups/" + usagName + "1.json": `{}`,
+	}))
+	if diffs, _ := Backups(a, b, Options{SkipUsers: []string{"pivotal"}}); len(diffs) != 0 {
+		t.Fatalf("without Extras: %+v", diffs)
+	}
+	res, err := Compare(a, b, Options{SkipUsers: []string{"pivotal"}, Extras: true,
+		Include: func(p string) bool { return !strings.HasPrefix(p, "orgs/other/") }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, d := range res.Differences {
+		got = append(got, d.Kind+" "+d.Path)
+	}
+	sort.Strings(got)
+	want := []string{"extra orgs/acme/groups/" + usagName + "1.json", "extra orgs/acme/nodes/extra.json", "extra server/users/stranger.json"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("extras = %v, want %v", got, want)
 	}
 }
