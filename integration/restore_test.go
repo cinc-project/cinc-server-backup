@@ -82,9 +82,19 @@ func seedExtras(t *testing.T, s *ngServer) []byte {
 		[]byte(`{"groupname":"devs","actors":{"users":["alice"],"clients":["db01"],"groups":[]}}`)); err != nil {
 		t.Fatalf("devs membership: %v", err)
 	}
+	// A client sharing the user alice's name, as Chef allows. The node ACL
+	// grants update to the user and delete to the client, so restore must
+	// keep the two apart (the granular users/clients form).
+	if _, _, err := c.Do(ctx, "POST", "/organizations/acme/clients", []byte(`{"name":"alice","create_key":true}`)); err != nil {
+		t.Fatalf("client alice: %v", err)
+	}
 	if _, _, err := c.Do(ctx, "PUT", "/organizations/acme/nodes/web01/_acl/update",
-		[]byte(`{"update":{"actors":["alice"],"groups":["admins","devs"]}}`)); err != nil {
-		t.Fatalf("node ACL: %v", err)
+		[]byte(`{"update":{"actors":[],"users":["alice"],"clients":[],"groups":["admins","devs"]}}`)); err != nil {
+		t.Fatalf("node ACL update: %v", err)
+	}
+	if _, _, err := c.Do(ctx, "PUT", "/organizations/acme/nodes/web01/_acl/delete",
+		[]byte(`{"delete":{"actors":[],"users":[],"clients":["alice"],"groups":["admins"]}}`)); err != nil {
+		t.Fatalf("node ACL delete: %v", err)
 	}
 	return []byte(created.ChefKey.PrivateKey)
 }
@@ -119,10 +129,6 @@ func normalize(t *testing.T, path string, data []byte) any {
 	switch {
 	case strings.HasSuffix(path, "/org.json"):
 		delete(m, "guid")
-	case strings.Contains(path, "/keys/"):
-		// cinc-server-ng adds "expired" to some single-key responses and not
-		// others (cinc-project/cinc-server-ng#266); erchef never sends it.
-		delete(m, "expired")
 	case strings.Contains(path, "/data_bags/") && strings.Count(path, "/") == 3:
 		// A bag's item listing: names to URLs on the source server's host.
 		var names []string
@@ -199,6 +205,34 @@ func sortBy(v any, key string) {
 		b, _ := l[j].(map[string]any)[key].(string)
 		return a < b
 	})
+}
+
+// The node ACL keeps the user alice and the client alice apart after restore.
+func TestRestoreKeepsSameNamedUserAndClientApart(t *testing.T) {
+	a := startNG(t, "acme")
+	seed(t, a)
+	seedExtras(t, a)
+	b := startNG(t, "unused")
+	restoreInto(t, backupBytes(t, a), b)
+
+	data, _, err := b.client(t, "").Do(context.Background(), "GET", "/organizations/acme/nodes/web01/_acl?detail=granular", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var acl map[string]struct {
+		Users   []string `json:"users"`
+		Clients []string `json:"clients"`
+	}
+	if err := json.Unmarshal(data, &acl); err != nil {
+		t.Fatalf("%s: %v", data, err)
+	}
+	has := func(l []string) bool { return strings.Contains(","+strings.Join(l, ",")+",", ",alice,") }
+	if !has(acl["update"].Users) || has(acl["update"].Clients) {
+		t.Errorf("update = %+v; want the user alice only", acl["update"])
+	}
+	if !has(acl["delete"].Clients) || has(acl["delete"].Users) {
+		t.Errorf("delete = %+v; want the client alice only", acl["delete"])
+	}
 }
 
 // The restore round trip: back up A, restore into an empty B, back up B. Every
