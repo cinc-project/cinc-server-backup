@@ -52,6 +52,11 @@ type Report struct {
 }
 
 func (r *Report) add(kind string) { r.mu.Lock(); r.Restored[kind]++; r.mu.Unlock() }
+func (r *Report) warn(w format.Warning) {
+	r.mu.Lock()
+	r.Warnings = append(r.Warnings, w)
+	r.mu.Unlock()
+}
 
 var usag = refs.USAG
 
@@ -279,11 +284,20 @@ func (rs *restorer) extraKeys(ctx context.Context, dir, base, kind string) error
 }
 
 func (rs *restorer) user(ctx context.Context, u string) error {
+	dir := "server/users/" + u
 	if rs.onTarget["user "+u] {
 		rs.rep.skip("users") // its keys and password stay the target's
+		same, err := rs.sameActor(ctx, "/users/"+esc(u), dir)
+		if err != nil {
+			return err
+		}
+		if !same {
+			rs.track.stranger("users/" + u)
+			rs.rep.warn(format.Warning{Code: "merge.different_user", Path: dir + ".json",
+				Detail: "the target's user " + u + " has a different key, so it gets none of the backup's memberships or permissions"})
+		}
 		return nil
 	}
-	dir := "server/users/" + u
 	doc, err := rs.object(dir + ".json")
 	if err != nil {
 		return err
@@ -337,6 +351,9 @@ func (rs *restorer) org(ctx context.Context, o string) error {
 			return fmt.Errorf("orgs/%s/members.json: %w", o, err)
 		}
 		for _, m := range members {
+			if rs.track.isStranger("users/" + m.User.Username) {
+				continue
+			}
 			b, _ := json.Marshal(map[string]string{"username": m.User.Username})
 			if ok, err := rs.write(ctx, "members", "POST", base+"/users", b); err != nil {
 				return err
@@ -353,6 +370,9 @@ func (rs *restorer) org(ctx context.Context, o string) error {
 			return fmt.Errorf("orgs/%s/invitations.json: %w", o, err)
 		}
 		for _, inv := range invites {
+			if rs.track.isStranger("users/" + inv.Username) {
+				continue
+			}
 			b, _ := json.Marshal(map[string]string{"user": inv.Username})
 			if ok, err := rs.write(ctx, "invitations", "POST", base+"/association_requests", b); err != nil {
 				return err
@@ -435,6 +455,15 @@ func (rs *restorer) clients(ctx context.Context, o string) error {
 		cbase := base + "/" + esc(name)
 		if have[name] && !rs.track.newOrg(o) {
 			rs.rep.skip("clients") // it and its keys stay the target's
+			same, err := rs.sameActor(ctx, cbase, dir)
+			if err != nil {
+				return err
+			}
+			if !same {
+				rs.track.stranger(o + "/clients/" + name)
+				rs.rep.warn(format.Warning{Code: "merge.different_client", Path: dir + ".json",
+					Detail: "the target's client " + name + " has a different key, so it gets none of the backup's memberships or permissions"})
+			}
 			return nil
 		}
 		if have[name] {
@@ -520,6 +549,8 @@ func (rs *restorer) groups(ctx context.Context, o string) error {
 		_ = json.Unmarshal(cur, &target)
 		// Dangling names were reported by resolve.
 		users, clients, groups, _ := rs.refs.Members(o, doc)
+		users = rs.withoutStrangers(o, "users", users)
+		clients = rs.withoutStrangers(o, "clients", clients)
 		if !rs.track.created(o, "groups", g) {
 			// The target's group: add the backup's members it lacks.
 			var cu, cc, cg bool
@@ -846,6 +877,7 @@ func (rs *restorer) putACL(ctx context.Context, p, base, o string, created bool)
 			continue
 		}
 		out, _, _ := rs.refs.ACE(o, ace)
+		out = rs.strangersOut(o, out)
 		if !created {
 			var changed bool
 			if out, changed = rs.mergeACE(o, target[perm], out); !changed {

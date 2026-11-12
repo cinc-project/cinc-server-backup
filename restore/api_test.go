@@ -87,3 +87,26 @@ func emptyBackup(t *testing.T) *format.Reader {
 	}
 	return r
 }
+
+// strangersOut drops a name only in lists the entry has, by type, so an
+// untyped entry stays untyped and a client sharing a stranger user's name keeps
+// its grant.
+func TestStrangersOut(t *testing.T) {
+	rs := &restorer{track: newTracker()}
+	rs.track.stranger("users/alice")
+
+	granular := rs.strangersOut("acme", map[string]any{
+		"actors": []string{}, "users": []string{"alice", "bob"}, "clients": []string{"alice"}, "groups": []string{"admins"},
+	})
+	if !reflect.DeepEqual(granular["users"], []string{"bob"}) || !reflect.DeepEqual(granular["clients"], []string{"alice"}) {
+		t.Errorf("granular = %v", granular)
+	}
+
+	untyped := rs.strangersOut("acme", map[string]any{"actors": []string{"alice", "bob"}, "groups": []string{}})
+	if _, ok := untyped["users"]; ok {
+		t.Errorf("an untyped entry gained a users list: %v", untyped)
+	}
+	if !reflect.DeepEqual(untyped["actors"], []string{"bob"}) {
+		t.Errorf("untyped actors = %v", untyped["actors"])
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	cinc "github.com/cinc-project/cinc-api"
@@ -42,10 +43,15 @@ type tracker struct {
 	orgs  map[string]bool // orgs this run created
 	users map[string]bool // users this run created
 	made  map[string]bool // "org\x00type\x00name" of objects this run created
+	// strangers are actors the target already had under a backup actor's
+	// name but with a different key: "users/<name>" or "<org>/clients/<name>".
+	// They are someone else, so no grant the backup gives that name reaches
+	// them.
+	strangers map[string]bool
 }
 
 func newTracker() *tracker {
-	return &tracker{orgs: map[string]bool{}, users: map[string]bool{}, made: map[string]bool{}}
+	return &tracker{orgs: map[string]bool{}, users: map[string]bool{}, made: map[string]bool{}, strangers: map[string]bool{}}
 }
 
 func (t *tracker) madeOrg(o string)  { t.mu.Lock(); t.orgs[o] = true; t.mu.Unlock() }
@@ -78,6 +84,73 @@ func (t *tracker) created(o, typ, name string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.orgs[o] || t.made[o+"\x00"+typ+"\x00"+name]
+}
+
+func (t *tracker) stranger(id string) { t.mu.Lock(); t.strangers[id] = true; t.mu.Unlock() }
+
+func (t *tracker) isStranger(id string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.strangers[id]
+}
+
+// sameActor reports whether the target's actor at base (an existing user or
+// client restore is skipping) holds the default public key the backup's actor
+// at dir has. Without a key on either side to compare, it is not the same.
+func (rs *restorer) sameActor(ctx context.Context, base, dir string) (bool, error) {
+	want, err := rs.defaultKey(dir)
+	if err != nil {
+		return false, err
+	}
+	data, err := rs.do(ctx, "GET", base+"/keys/default", nil, "1")
+	if errors.Is(err, cinc.ErrNotFound) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	var k struct {
+		PublicKey string `json:"public_key"`
+	}
+	if err := json.Unmarshal(data, &k); err != nil {
+		return false, fmt.Errorf("decode %s/keys/default: %w", base, err)
+	}
+	return want != "" && squash(want) == squash(k.PublicKey), nil
+}
+
+// squash drops the whitespace a PEM may be wrapped or indented with.
+func squash(s string) string { return strings.Join(strings.Fields(s), "") }
+
+// withoutStrangers drops from a member list (kind "users" or "clients") the
+// names that belong to someone else on the target.
+func (rs *restorer) withoutStrangers(o, kind string, l []string) []string {
+	out := make([]string, 0, len(l))
+	for _, n := range l {
+		id := "users/" + n
+		if kind == "clients" {
+			id = o + "/clients/" + n
+		}
+		if !rs.track.isStranger(id) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// strangersOut applies withoutStrangers to an ACE as refs.ACE resolved it.
+// An untyped actor is dropped if it names a stranger of either kind.
+// Only lists the entry has are touched, so an untyped entry stays untyped.
+func (rs *restorer) strangersOut(o string, ace map[string]any) map[string]any {
+	for _, kind := range []string{"users", "clients"} {
+		if v, ok := ace[kind]; ok {
+			ace[kind] = rs.withoutStrangers(o, kind, names(v))
+		}
+	}
+	actors := rs.withoutStrangers(o, "users", names(ace["actors"]))
+	if o != "" {
+		actors = rs.withoutStrangers(o, "clients", actors)
+	}
+	ace["actors"] = actors
+	return ace
 }
 
 func (r *Report) skip(kind string) { r.mu.Lock(); r.Skipped[kind]++; r.mu.Unlock() }
