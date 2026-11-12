@@ -151,3 +151,72 @@ func TestDefaultsAndDerivedFieldsAreSetAside(t *testing.T) {
 		t.Fatalf("diffs = %+v, want the frozen flag and the revision", diffs)
 	}
 }
+
+// A name the first backup's ACL or group holds but the backup itself does
+// not (a deleted user) is dropped, not a difference, when the second lacks
+// it. Anything else missing from the same object is still a difference.
+func TestDanglingNamesTheTargetLacksAreDropped(t *testing.T) {
+	objs := with(map[string]string{
+		"orgs/acme/acls/nodes/web01.json": `{"update":{"actors":[],"users":["alice","ghost"],"clients":["gone01"],"groups":["admins"]}}`,
+		"orgs/acme/groups/admins.json":    `{"groupname":"admins","users":["alice","ghost"],"clients":[],"groups":[]}`,
+	})
+	a := build(t, objs)
+	b := build(t, with(map[string]string{
+		"orgs/acme/acls/nodes/web01.json": `{"update":{"actors":[],"users":["alice"],"clients":[],"groups":["admins"]}}`,
+		"orgs/acme/groups/admins.json":    `{"groupname":"admins","users":["alice"],"clients":[],"groups":[]}`,
+	}))
+	res, err := Compare(a, b, Options{SkipUsers: []string{"pivotal"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Differences) != 0 {
+		t.Fatalf("differences = %+v", res.Differences)
+	}
+	var got []string
+	for _, d := range res.Dropped {
+		got = append(got, d.Path+" "+d.Detail)
+	}
+	want := []string{
+		"orgs/acme/acls/nodes/web01.json update: user ghost",
+		"orgs/acme/acls/nodes/web01.json update: client gone01",
+		"orgs/acme/groups/admins.json user ghost",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("dropped:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+
+	// The same backup compared with its own source: nothing was dropped.
+	if res, _ := Compare(a, a, Options{}); len(res.Dropped) != 0 || len(res.Differences) != 0 {
+		t.Errorf("against itself: dropped %+v, differences %+v", res.Dropped, res.Differences)
+	}
+
+	// The target also lost alice, whom the backup holds: a difference.
+	c := build(t, with(map[string]string{
+		"orgs/acme/acls/nodes/web01.json": `{"update":{"actors":[],"users":[],"clients":[],"groups":["admins"]}}`,
+		"orgs/acme/groups/admins.json":    `{"groupname":"admins","users":["alice"],"clients":[],"groups":[]}`,
+	}))
+	res, _ = Compare(a, c, Options{SkipUsers: []string{"pivotal"}})
+	if len(res.Differences) != 1 || res.Differences[0].Path != "orgs/acme/acls/nodes/web01.json" {
+		t.Errorf("differences = %+v, want web01's ACL", res.Differences)
+	}
+}
+
+func TestCompareCountsPreservedRegeneratedAndSkipped(t *testing.T) {
+	a := build(t, base, "file")
+	b := build(t, with(map[string]string{
+		"orgs/acme/org.json": `{"name":"acme","guid":"bbb"}`,
+	}), "file")
+	res, err := Compare(a, b, Options{SkipUsers: []string{"pivotal"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Preserved["nodes"] != 1 || res.Preserved["blobs"] != 1 || res.Preserved["orgs"] != 1 {
+		t.Errorf("preserved = %v", res.Preserved)
+	}
+	if res.Regenerated != 1 {
+		t.Errorf("regenerated = %d, want 1 (the org guid)", res.Regenerated)
+	}
+	if res.Skipped != 2 {
+		t.Errorf("skipped = %d, want 2 (pivotal and the per-user group)", res.Skipped)
+	}
+}

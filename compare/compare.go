@@ -7,11 +7,11 @@ import (
 	"encoding/json"
 	"path"
 	"reflect"
-	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/cinc-project/cinc-server-backup/format"
+	"github.com/cinc-project/cinc-server-backup/internal/refs"
 )
 
 // Kinds of difference.
@@ -37,7 +37,32 @@ type Options struct {
 
 // usag matches the per-user groups a server names after a user's internal
 // id, which every server assigns afresh.
-var usag = regexp.MustCompile(`^[0-9a-f]{32}$`)
+var usag = refs.USAG
+
+// Dropped is a name in one of the first backup's ACLs or groups that the
+// backup does not hold (a dangling reference, such as a deleted user) and
+// that the second lacks, as a restore leaves it out.
+type Dropped struct {
+	Path   string
+	Detail string // "update: user ghost" for an ACL, "user ghost" for a group
+}
+
+// Result is what a comparison found.
+type Result struct {
+	// Differences are what the second backup lacks or holds differently.
+	Differences []Difference
+	// Preserved counts the objects and files that match, by the kind the
+	// manifest counts them under ("other" for uncounted paths).
+	Preserved map[string]int
+	// Regenerated counts the objects among those that match only once the
+	// values a server regenerates are set aside.
+	Regenerated int
+	// Dropped lists the dangling names the second backup lacks.
+	Dropped []Dropped
+	// Skipped counts what is not compared: skipped users' objects, and
+	// per-user groups.
+	Skipped int
+}
 
 // Backups reports every object or file in a that is missing from b or differs
 // from b's copy once regenerated values are set aside: org GUIDs, file URLs
@@ -45,20 +70,45 @@ var usag = regexp.MustCompile(`^[0-9a-f]{32}$`)
 // group's uri and name, a cookbook's missing "frozen?" (erchef's default,
 // false), and the order of members, actors and groups. Objects only in b are not reported, so a
 // target may hold more than the backup restored into it.
+//
+// Names in a's ACLs and groups that a does not hold are dangling. When b
+// lacks them, as it does after a restore left them out, the object still
+// matches and the names are reported as dropped; Backups returns only the
+// differences, and Compare everything.
 func Backups(a, b *format.Reader, opts Options) ([]Difference, error) {
+	res, err := Compare(a, b, opts)
+	if err != nil {
+		return nil, err
+	}
+	return res.Differences, nil
+}
+
+// Compare is Backups with the full result.
+func Compare(a, b *format.Reader, opts Options) (*Result, error) {
 	skip := map[string]bool{}
 	for _, u := range opts.SkipUsers {
 		skip[u] = true
 	}
-	var out []Difference
+	known := refs.FromBackup(a)
+	res := &Result{Preserved: map[string]int{}}
+	preserved := func(p string) {
+		k := format.CountKey(p)
+		if k == "" {
+			k = "other"
+		}
+		res.Preserved[k]++
+	}
 	for _, e := range a.Manifest().Entries {
 		p := e.Path
 		if skipped(p, skip) {
+			res.Skipped++
 			continue
 		}
 		if strings.HasPrefix(p, "blobs/") {
 			if _, ok := b.Entry(p); !ok {
-				out = append(out, Difference{Path: p, Kind: Missing})
+				res.Differences = append(res.Differences, Difference{Path: p, Kind: Missing})
+			} else {
+				preserved(p)
 			}
 			continue
 		}
@@ -67,7 +117,7 @@ func Backups(a, b *format.Reader, opts Options) ([]Difference, error) {
 			return nil, err
 		}
 		if _, ok := b.Entry(p); !ok {
-			out = append(out, Difference{Path: p, Kind: Missing})
+			res.Differences = append(res.Differences, Difference{Path: p, Kind: Missing})
 			continue
 		}
 		db, err := b.Object(p)
@@ -82,11 +132,93 @@ func Backups(a, b *format.Reader, opts Options) ([]Difference, error) {
 		if err != nil {
 			return nil, err
 		}
-		if !reflect.DeepEqual(na, nb) {
-			out = append(out, Difference{Path: p, Kind: Changed, Before: string(da), After: string(db)})
+		if reflect.DeepEqual(na, nb) {
+			preserved(p)
+			if !bytes.Equal(da, db) {
+				res.Regenerated++
+			}
+			continue
+		}
+		// Unequal: equal once a's dangling names are left out?
+		without, dropped, err := withoutDangling(known, p, da)
+		if err != nil {
+			return nil, err
+		}
+		if len(dropped) > 0 {
+			nw, err := normalize(p, without)
+			if err != nil {
+				return nil, err
+			}
+			if reflect.DeepEqual(nw, nb) {
+				preserved(p)
+				res.Dropped = append(res.Dropped, dropped...)
+				continue
+			}
+		}
+		res.Differences = append(res.Differences, Difference{Path: p, Kind: Changed, Before: string(da), After: string(db)})
+	}
+	return res, nil
+}
+
+// listKey is the member list each kind of dangling name sits in.
+var listKey = map[string]string{"user": "users", "client": "clients", "actor": "actors", "group": "groups"}
+
+// withoutDangling returns the ACL or group stored at p without the names
+// the backup does not hold, and those names. Any other object comes back
+// unchanged, with none.
+func withoutDangling(k *refs.Known, p string, data []byte) ([]byte, []Dropped, error) {
+	o, isACL, isGroup, ok := refs.Scope(p)
+	if !ok {
+		return data, nil, nil
+	}
+	var m map[string]any
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&m); err != nil {
+		return nil, nil, err
+	}
+	var dropped []Dropped
+	remove := func(lists map[string]any, labels []string, prefix string) {
+		for _, l := range labels {
+			kind, name, _ := strings.Cut(l, " ")
+			key := listKey[kind]
+			var kept []any
+			for _, v := range refs.Strings(lists[key]) {
+				if v != name {
+					kept = append(kept, v)
+				}
+			}
+			if kept == nil {
+				kept = []any{}
+			}
+			lists[key] = kept
+			dropped = append(dropped, Dropped{Path: p, Detail: prefix + l})
 		}
 	}
-	return out, nil
+	switch {
+	case isACL:
+		perms := make([]string, 0, len(m))
+		for perm := range m {
+			perms = append(perms, perm)
+		}
+		sort.Strings(perms)
+		for _, perm := range perms {
+			ace, ok := m[perm].(map[string]any)
+			if !ok {
+				continue
+			}
+			_, _, d := k.ACE(o, ace)
+			remove(ace, d, perm+": ")
+		}
+	case isGroup:
+		_, _, _, d := k.Members(o, m)
+		remove(m, d, "")
+	}
+	if len(dropped) == 0 {
+		return data, nil, nil
+	}
+	out, err := json.Marshal(m)
+	return out, dropped, err
 }
 
 // skipped reports paths that are not compared: a skipped user and their keys

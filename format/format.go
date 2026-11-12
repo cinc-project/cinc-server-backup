@@ -149,9 +149,10 @@ func validMD5(s string) bool {
 	return err == nil
 }
 
-// countKey names the collection a path is counted under, or "" for paths
-// that are not counted (org metadata files, ACLs are counted as "acls").
-func countKey(p string) string {
+// CountKey names the collection the manifest counts a path under ("nodes",
+// "client_keys", "acls"), or "" for paths that are not counted, such as
+// members.json.
+func CountKey(p string) string {
 	segs := strings.Split(p, "/")
 	switch segs[0] {
 	case "blobs":
@@ -351,7 +352,7 @@ func (w *Writer) Close() error {
 	}
 	for _, e := range w.entries {
 		m.Entries = append(m.Entries, e)
-		if k := countKey(e.Path); k != "" {
+		if k := CountKey(e.Path); k != "" {
 			m.Counts[k]++
 		}
 	}

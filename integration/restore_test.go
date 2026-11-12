@@ -319,8 +319,9 @@ func TestRestoreRefusesNonEmptyTarget(t *testing.T) {
 	}
 }
 
-// edit returns a copy of r with fn applied to every object's bytes.
-func edit(t *testing.T, r *format.Reader, fn func(path string, data []byte) []byte) *format.Reader {
+// editBytes returns a copy of r, as a backup file's bytes, with fn applied
+// to every object's bytes.
+func editBytes(t *testing.T, r *format.Reader, fn func(path string, data []byte) []byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	m := r.Manifest()
@@ -354,11 +355,7 @@ func edit(t *testing.T, r *format.Reader, fn func(path string, data []byte) []by
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	out, err := format.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return out
+	return buf.Bytes()
 }
 
 // withDangling backs up a seeded server, then makes web01's update ACL name
@@ -366,10 +363,21 @@ func edit(t *testing.T, r *format.Reader, fn func(path string, data []byte) []by
 // backup of a server where they were deleted after being granted access.
 func withDangling(t *testing.T) *format.Reader {
 	t.Helper()
+	data := danglingBytes(t)
+	r, err := format.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// danglingBytes is withDangling, as a backup file's bytes.
+func danglingBytes(t *testing.T) []byte {
+	t.Helper()
 	a := startNG(t, "acme")
 	seed(t, a)
 	seedExtras(t, a)
-	return edit(t, backupBytes(t, a), func(p string, data []byte) []byte {
+	return editBytes(t, backupBytes(t, a), func(p string, data []byte) []byte {
 		add := func(m map[string]any, key, name string) {
 			l, _ := m[key].([]any)
 			m[key] = append(l, name)

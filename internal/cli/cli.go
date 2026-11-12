@@ -35,7 +35,8 @@ type usageError struct{ error }
 func usagef(format string, a ...any) error { return usageError{fmt.Errorf(format, a...)} }
 
 // Run executes the command line args (without the program name) and returns
-// the process exit code: 0 success, 1 failure, 2 usage error.
+// the process exit code: 0 success, 1 failure, 2 usage error, 3 when verify
+// finds a server holding everything but the dangling names it reports.
 func Run(args []string, stdout, stderr io.Writer) int {
 	root := newRootCmd()
 	root.SetArgs(args)
@@ -52,6 +53,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 	if errors.Is(err, errDifferent) {
 		return 1 // the command printed what differs
+	}
+	if errors.Is(err, errDropped) {
+		return 3 // verify printed what was dropped
 	}
 	var ue usageError
 	if errors.As(err, &ue) || strings.HasPrefix(err.Error(), "unknown command") {
@@ -335,7 +339,10 @@ func newDiffCmd() *cobra.Command {
 is missing from the second or differs there. Values a server regenerates on
 its own are set aside: organization GUIDs, cookbook file URLs, the URLs in
 listings, per-user group names, and the order of members and ACL entries.
-Objects only in the second backup are not reported.
+Objects only in the second backup are not reported. A name in the first
+backup's ACLs or groups that the backup doesn't hold (such as a deleted user)
+and the second lacks is listed as dropped, not as a difference: restore
+leaves such names out.
 
 Use it to check a migration: back up the old server, restore into the new
 one, back up the new one, and diff the two. Each server's own superuser has
@@ -367,21 +374,20 @@ cinc-server-backup diff old-server.csb new-server.csb`,
 					skip = append(skip, u)
 				}
 			}
-			diffs, err := compare.Backups(a, b, compare.Options{SkipUsers: skip})
+			res, err := compare.Compare(a, b, compare.Options{SkipUsers: skip})
 			if err != nil {
 				return err
 			}
 			out := cmd.OutOrStdout()
+			for _, d := range res.Dropped {
+				fmt.Fprintf(out, "%-8s %s %s\n", "dropped", d.Path, d.Detail)
+			}
+			diffs := res.Differences
 			if len(diffs) == 0 {
 				fmt.Fprintln(out, "No differences.")
 				return nil
 			}
-			for _, d := range diffs {
-				fmt.Fprintf(out, "%-8s %s\n", d.Kind, d.Path)
-				if d.Kind == compare.Changed {
-					fmt.Fprintf(out, "  before %s\n  after  %s\n", strings.TrimSpace(d.Before), strings.TrimSpace(d.After))
-				}
-			}
+			printDifferences(out, diffs)
 			fmt.Fprintf(out, "%d differences\n", len(diffs))
 			return errDifferent
 		},
@@ -390,27 +396,158 @@ cinc-server-backup diff old-server.csb new-server.csb`,
 	return cmd
 }
 
+type verifyFlags struct {
+	server, user, key string
+	concurrency       int
+	blobHosts         []string
+}
+
 func newVerifyCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "verify <file.csb>",
-		Short: "Check that a backup is complete and unchanged",
+	var f verifyFlags
+	cmd := &cobra.Command{
+		Use:   "verify <file.csb> [--server <url> --key <pem>]",
+		Short: "Check that a backup is intact, or that a server holds what it does",
 		Long: `Check every file in a backup against the checksums in its manifest. Verify
-fails if anything was changed, removed or added since the backup was written.`,
+fails if anything was changed, removed or added since the backup was written.
+
+With --server, verify then backs that server up into a temporary file and
+compares it with the backup, object by object, as diff does, and prints a
+fidelity report:
+
+  preserved    what the server holds as the backup does, by kind
+  regenerated  how many of those matched only once the values a server
+               regenerates were set aside (org GUIDs, file URLs, per-user
+               group names, member order)
+  skipped      the superuser verify signs as, and per-user groups
+  dropped      names in the backup's ACLs and groups that the backup itself
+               doesn't hold (such as a deleted user) and the server lacks,
+               as restore leaves them out
+  differences  everything else the server lacks or holds differently
+
+Use it after a restore to check the target, right after a backup to check
+the source, or any time later to see whether a server has drifted. The
+temporary file is readable by you alone and removed when verify finishes.
+
+Verify exits 0 when the server holds everything, 3 when it holds everything
+but the dropped names, and 1 when anything differs.`,
 		Example: `Check a backup before relying on it.
-cinc-server-backup verify chef.csb`,
+cinc-server-backup verify chef.csb
+
+Check that a restore carried everything over.
+cinc-server-backup verify chef.csb --server https://new-chef.example.com --key pivotal.pem`,
 		Args: exactlyOneBackup,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			r, f, err := format.Open(args[0])
-			if err != nil {
-				return err
-			}
-			defer func() { _ = f.Close() }() // read-only
-			if err := r.Verify(); err != nil {
-				return err
-			}
-			fmt.Fprintf(cmd.OutOrStdout(), "ok: %d entries verified\n", len(r.Manifest().Entries))
-			return nil
-		},
+		RunE: func(cmd *cobra.Command, args []string) error { return runVerify(cmd, args[0], f) },
+	}
+	fl := cmd.Flags()
+	fl.StringVar(&f.server, "server", "", "URL of a server to compare with the backup")
+	fl.StringVar(&f.user, "user", "pivotal", "superuser to sign requests as; left out of the comparison")
+	fl.StringVar(&f.key, "key", "", "path to that superuser's private key (required with --server)")
+	fl.IntVar(&f.concurrency, "concurrency", 8, "most requests to have in flight at once")
+	fl.StringArrayVar(&f.blobHosts, "blob-host", nil, "extra host[:port] cookbook files may come from, such as an S3 bookshelf (repeatable)")
+	return cmd
+}
+
+// errDropped is verify's "everything but the dangling names" result: exit 3
+// with no error message.
+var errDropped = errors.New("dangling names dropped")
+
+func runVerify(cmd *cobra.Command, file string, f verifyFlags) error {
+	if f.server == "" && f.key != "" {
+		return usagef("--key needs --server")
+	}
+	if f.server != "" && f.key == "" {
+		return usagef("verify --server needs --key")
+	}
+	r, fh, err := format.Open(file)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fh.Close() }() // read-only
+	if err := r.Verify(); err != nil {
+		return err
+	}
+	out := cmd.OutOrStdout()
+	fmt.Fprintf(out, "ok: %d entries verified\n", len(r.Manifest().Entries))
+	if f.server == "" {
+		return nil
+	}
+
+	opts := capture.Options{Concurrency: f.concurrency, BlobHosts: f.blobHosts}
+	c, err := newClient(f.server, f.user, f.key, opts.BlobHosts)
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
+	defer stop()
+	tmp, err := os.CreateTemp("", "csb-verify-*.csb") // created 0600
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tmp.Close(); _ = os.Remove(tmp.Name()) }()
+	fmt.Fprintf(out, "backing up %s to compare\n", f.server)
+	w := format.NewWriter(tmp, format.Source{URL: f.server})
+	w.SetTool(progName + " " + Version)
+	if err := capture.FromAPI(ctx, c, w, opts); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	st, err := tmp.Stat()
+	if err != nil {
+		return err
+	}
+	live, err := format.NewReader(tmp, st.Size())
+	if err != nil {
+		return err
+	}
+	res, err := compare.Compare(r, live, compare.Options{SkipUsers: []string{f.user}})
+	if err != nil {
+		return err
+	}
+	printFidelity(out, file, f.server, res)
+	switch {
+	case len(res.Differences) > 0:
+		return errDifferent
+	case len(res.Dropped) > 0:
+		return errDropped
+	}
+	return nil
+}
+
+// printFidelity prints verify's report of how a server matches a backup.
+func printFidelity(out io.Writer, file, server string, res *compare.Result) {
+	fmt.Fprintf(out, "\nfidelity: %s -> %s\n", file, server)
+	tw := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+	kinds := make([]string, 0, len(res.Preserved))
+	total := 0
+	for k, n := range res.Preserved {
+		kinds = append(kinds, k)
+		total += n
+	}
+	sort.Strings(kinds)
+	fmt.Fprintf(tw, "  preserved\t%d\n", total)
+	for _, k := range kinds {
+		fmt.Fprintf(tw, "    %s\t%d\n", k, res.Preserved[k])
+	}
+	fmt.Fprintf(tw, "  regenerated\t%d\t(expected: matched once server-generated values were set aside)\n", res.Regenerated)
+	fmt.Fprintf(tw, "  skipped\t%d\t(the signing superuser and per-user groups)\n", res.Skipped)
+	fmt.Fprintf(tw, "  dropped\t%d\t(names the backup doesn't hold)\n", len(res.Dropped))
+	for _, d := range res.Dropped {
+		fmt.Fprintf(tw, "    %s\t%s\n", d.Path, d.Detail)
+	}
+	fmt.Fprintf(tw, "  differences\t%d\n", len(res.Differences))
+	_ = tw.Flush()
+	printDifferences(out, res.Differences)
+}
+
+// printDifferences lists differences as diff prints them.
+func printDifferences(out io.Writer, diffs []compare.Difference) {
+	for _, d := range diffs {
+		fmt.Fprintf(out, "%-8s %s\n", d.Kind, d.Path)
+		if d.Kind == compare.Changed {
+			fmt.Fprintf(out, "  before %s\n  after  %s\n", strings.TrimSpace(d.Before), strings.TrimSpace(d.After))
+		}
 	}
 }
 
