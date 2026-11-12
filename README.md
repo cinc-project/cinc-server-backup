@@ -13,9 +13,9 @@ Backup, restore and `verify --server` over the API work. Restore needs an empty 
 | Command | What it does |
 |---|---|
 | `backup --server URL --user NAME --key PEM -o FILE` | Crawls the whole server over its API as a superuser and writes a `.csb` file (0600, written atomically) |
-| `restore FILE --server URL --key PEM` | Checks the backup's checksums, then restores it into an empty server over its API; clients and users keep their keys. ACL entries and group members naming a user, client or group the backup lacks are left out and listed (`--dangling fail` stops instead). Then checks the target as `verify --server` does (`--no-verify` skips it); exits 0, 3 when only dangling names were dropped, or 1 |
+| `restore FILE --server URL --key PEM` | Checks the backup's checksums, then restores it into an empty server over its API; clients and users keep their keys. ACL entries and group members naming a user, client or group the backup lacks are left out and listed (`--dangling fail` stops instead). `--org`/`--exclude-org` restore part of it, with the users those orgs name. Then checks the target as `verify --server` does (`--no-verify` skips it); exits 0, 3 when only dangling names were dropped, or 1 |
 | `inspect FILE` | Prints source, time window, per-collection counts and warnings |
-| `verify FILE [--server URL --key PEM]` | Checks every member against the manifest's SHA-256 digests. With `--server`, also backs that server up and prints a fidelity report: what it preserved, regenerated and dropped, and every difference. Exits 0, 3 when only dangling names were dropped, or 1 |
+| `verify FILE [--server URL --key PEM]` | Checks every member against the manifest's SHA-256 digests. With `--server` (and optionally `--org`/`--exclude-org`), also backs that server up and prints a fidelity report: what it preserved, regenerated and dropped, and every difference. Exits 0, 3 when only dangling names were dropped, or 1 |
 | `diff BEFORE AFTER` | Lists what the first backup holds that the second lacks or holds differently, setting aside what a server regenerates (GUIDs, URLs, per-user group names); exits 1 when anything differs |
 | `version` | Prints the version |
 
