@@ -50,3 +50,29 @@ jobs:
         with:
           version: v2.14.0
           working-directory: integration
+
+  e2e-ng:
+    # Backs up a real cinc-server-ng (the released container image, loaded with
+    # its own dev/test-repo fixture), restores it into a fresh one, backs that
+    # up and diffs the two backups. The version tracks integration/go.mod, so a
+    # Dependabot bump of cinc-server-ng moves the image and fixture with it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: go.mod }
+      - id: ng
+        working-directory: integration
+        run: |
+          v=$(go list -m -f '{{.Version}}' github.com/cinc-project/cinc-server-ng)
+          echo "tag=$v" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/cinc-project/cinc-server-ng:${v#v}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: cinc-project/cinc-server-ng
+          ref: ${{ steps.ng.outputs.tag }}
+          path: ng
+          sparse-checkout: dev/test-repo
+      - run: scripts/e2e-ng.sh ng/dev/test-repo
+        env:
+          NG_IMAGE: ${{ steps.ng.outputs.image }}

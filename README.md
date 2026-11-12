@@ -16,6 +16,7 @@ Backup and restore over the API work. Restore needs an empty target; the host ti
 | `restore FILE --server URL --key PEM` | Checks the backup's checksums, then restores it into an empty server over its API; clients and users keep their keys |
 | `inspect FILE` | Prints source, time window, per-collection counts and warnings |
 | `verify FILE` | Checks every member against the manifest's SHA-256 digests |
+| `diff BEFORE AFTER` | Lists what the first backup holds that the second lacks or holds differently, setting aside what a server regenerates (GUIDs, URLs, per-user group names); exits 1 when anything differs |
 | `version` | Prints the version |
 
 Every command has `--help` with a description and examples, and `completion` prints shell completion scripts.
@@ -29,6 +30,8 @@ go test -race ./...
 cd integration && go test -race ./...
 golangci-lint run ./... && (cd integration && golangci-lint run ./...)
 ```
+
+`scripts/e2e-ng.sh <fixture>` runs the whole cycle against a real cinc-server-ng: it starts a server loaded from the fixture and an empty one (the container image with `NG_IMAGE`, or a binary with `NG_BIN`), backs up, verifies, restores, backs up the target and diffs. CI runs it with the released image and cinc-server-ng's `dev/test-repo`.
 
 ## License
 

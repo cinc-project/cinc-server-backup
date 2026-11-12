@@ -130,11 +130,9 @@ func (rs *restorer) do(ctx context.Context, method, p string, body []byte, v str
 	if v == "" {
 		v = "1"
 	}
+	// cinc-api's errors already name the method and path.
 	data, _, err := rs.c.Do(cinc.WithServerAPIVersion(ctx, v), method, p, body)
-	if err != nil {
-		return nil, fmt.Errorf("%s %s: %w", method, p, err)
-	}
-	return data, nil
+	return data, err
 }
 
 // object reads and decodes a backup object, keeping numbers exact.

@@ -18,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/cinc-project/cinc-server-backup/capture"
+	"github.com/cinc-project/cinc-server-backup/compare"
 	"github.com/cinc-project/cinc-server-backup/format"
 	"github.com/cinc-project/cinc-server-backup/restore"
 )
@@ -49,6 +50,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	if err == nil {
 		return 0
 	}
+	if errors.Is(err, errDifferent) {
+		return 1 // the command printed what differs
+	}
 	var ue usageError
 	if errors.As(err, &ue) || strings.HasPrefix(err.Error(), "unknown command") {
 		fmt.Fprintf(stderr, "Error: %v\nRun '%s --help' to see how to use it.\n", err, cmd.CommandPath())
@@ -74,7 +78,7 @@ manifest of checksums lets you prove later that nothing changed.`,
 		SilenceErrors: true,
 	}
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError{err} })
-	root.AddCommand(newBackupCmd(), newRestoreCmd(), newInspectCmd(), newVerifyCmd(), newVersionCmd())
+	root.AddCommand(newBackupCmd(), newRestoreCmd(), newInspectCmd(), newVerifyCmd(), newDiffCmd(), newVersionCmd())
 	return root
 }
 
@@ -301,6 +305,74 @@ func printReport(out io.Writer, rep *restore.Report) {
 		}
 	}
 	_ = tw.Flush()
+}
+
+// errDifferent is diff's "the backups differ" result: exit 1 with no error
+// message, as diff(1) does.
+var errDifferent = errors.New("backups differ")
+
+func newDiffCmd() *cobra.Command {
+	var skipUsers []string
+	cmd := &cobra.Command{
+		Use:   "diff <before.csb> <after.csb>",
+		Short: "Show what one backup holds that another lacks or holds differently",
+		Long: `Compare two backups object by object and list everything in the first that
+is missing from the second or differs there. Values a server regenerates on
+its own are set aside: organization GUIDs, cookbook file URLs, the URLs in
+listings, per-user group names, and the order of members and ACL entries.
+Objects only in the second backup are not reported.
+
+Use it to check a migration: back up the old server, restore into the new
+one, back up the new one, and diff the two. Each server's own superuser has
+its own key, so pivotal is skipped unless you say otherwise with --skip-user.
+
+Diff exits 0 when nothing differs and 1 when something does.`,
+		Example: `Check that a restore carried everything over.
+cinc-server-backup diff old-server.csb new-server.csb`,
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) != 2 {
+				return usagef("diff needs two backup files, and we got %d", len(args))
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			a, fa, err := format.Open(args[0])
+			if err != nil {
+				return err
+			}
+			defer func() { _ = fa.Close() }() // read-only
+			b, fb, err := format.Open(args[1])
+			if err != nil {
+				return err
+			}
+			defer func() { _ = fb.Close() }() // read-only
+			var skip []string
+			for _, u := range skipUsers {
+				if u != "" {
+					skip = append(skip, u)
+				}
+			}
+			diffs, err := compare.Backups(a, b, compare.Options{SkipUsers: skip})
+			if err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+			if len(diffs) == 0 {
+				fmt.Fprintln(out, "No differences.")
+				return nil
+			}
+			for _, d := range diffs {
+				fmt.Fprintf(out, "%-8s %s\n", d.Kind, d.Path)
+				if d.Kind == compare.Changed {
+					fmt.Fprintf(out, "  before %s\n  after  %s\n", strings.TrimSpace(d.Before), strings.TrimSpace(d.After))
+				}
+			}
+			fmt.Fprintf(out, "%d differences\n", len(diffs))
+			return errDifferent
+		},
+	}
+	cmd.Flags().StringArrayVar(&skipUsers, "skip-user", []string{"pivotal"}, "user to leave out of the comparison, such as each server's superuser (repeatable; pass an empty value to skip nobody)")
+	return cmd
 }
 
 func newVerifyCmd() *cobra.Command {
