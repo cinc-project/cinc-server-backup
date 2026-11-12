@@ -13,7 +13,7 @@ Backup, restore and `verify --server` over the API work. Restore needs an empty 
 | Command | What it does |
 |---|---|
 | `backup --server URL --user NAME --key PEM -o FILE` | Crawls the whole server over its API as a superuser and writes a `.csb` file (0600, written atomically) |
-| `restore FILE --server URL --key PEM` | Checks the backup's checksums, then restores it into an empty server over its API; clients and users keep their keys. ACL entries and group members naming a user, client or group the backup lacks are left out and listed (`--dangling fail` stops instead) |
+| `restore FILE --server URL --key PEM` | Checks the backup's checksums, then restores it into an empty server over its API; clients and users keep their keys. ACL entries and group members naming a user, client or group the backup lacks are left out and listed (`--dangling fail` stops instead). Then checks the target as `verify --server` does (`--no-verify` skips it); exits 0, 3 when only dangling names were dropped, or 1 |
 | `inspect FILE` | Prints source, time window, per-collection counts and warnings |
 | `verify FILE [--server URL --key PEM]` | Checks every member against the manifest's SHA-256 digests. With `--server`, also backs that server up and prints a fidelity report: what it preserved, regenerated and dropped, and every difference. Exits 0, 3 when only dangling names were dropped, or 1 |
 | `diff BEFORE AFTER` | Lists what the first backup holds that the second lacks or holds differently, setting aside what a server regenerates (GUIDs, URLs, per-user group names); exits 1 when anything differs |
@@ -31,7 +31,7 @@ cd integration && go test -race ./...
 golangci-lint run ./... && (cd integration && golangci-lint run ./...)
 ```
 
-`.github/scripts/e2e-ng.sh <fixture>` runs the whole cycle against a real cinc-server-ng: it starts a server loaded from the fixture and an empty one (the container image with `NG_IMAGE`, or a binary with `NG_BIN`), backs up, verifies, restores, backs up the target and diffs. It then gives a copy of the backup a deleted user and client in an ACL and a group, as an erchef backup can have, and checks that `--dangling fail` writes nothing and the default leaves out exactly those names. CI runs it with the released image and cinc-server-ng's `dev/test-repo`.
+`.github/scripts/e2e-ng.sh <fixture>` runs the whole cycle against a real cinc-server-ng: it starts a server loaded from the fixture and an empty one (the container image with `NG_IMAGE`, or a binary with `NG_BIN`), backs up, verifies, restores (which checks its own result), backs up the target and diffs. It then gives a copy of the backup a deleted user and client in an ACL and a group, as an erchef backup can have, and checks that `--dangling fail` writes nothing and the default leaves out exactly those names. CI runs it with the released image and cinc-server-ng's `dev/test-repo`.
 
 ## License
 

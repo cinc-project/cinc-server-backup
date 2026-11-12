@@ -10,8 +10,9 @@
 # was deleted; ng removes the names, so its backups never have them). Restore
 # into another fresh server must refuse it with --dangling fail and write
 # nothing, then with the default (drop) report exactly the injected names and
-# produce the same server as the clean backup. verify --server must exit 0
-# for the clean target and 3 (everything but the dropped names) for this one.
+# produce the same server as the clean backup. Restore checks its own result,
+# and verify --server checks it again: both exit 0 for the clean target and 3
+# (everything but the dropped names) for this one.
 #
 # Exits non-zero on the first failure, including any difference.
 #
@@ -102,9 +103,16 @@ fi
 cat "$work/fail.out"
 grep -q "nothing was restored" "$work/fail.out"
 
-echo "== the default (drop) must leave out exactly the injected names"
+echo "== the default (drop) must leave out exactly the injected names, and exit 3"
+set +e
 "$csb" restore "$work/dangling.csb" --server "http://127.0.0.1:$dangle_port" --key "$work/keys/dangle.pem" \
   | tee "$work/drop.out"
+code=${PIPESTATUS[0]}
+set -e
+if [[ $code -ne 3 ]]; then
+  echo "restore exited $code; want 3 (everything but the dropped names)" >&2
+  exit 1
+fi
 awk '/dangling_dropped/ {print $1, $2, $3, $4, $5}' "$work/drop.out" | sed 's/ *$//' | sort >"$work/dangling.got"
 diff -u "$work/dangling.want" "$work/dangling.got"
 
