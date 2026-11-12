@@ -27,6 +27,9 @@ import (
 type Options struct {
 	// Concurrency bounds the requests in flight. Zero means 8.
 	Concurrency int
+	// Dangling says what to do with ACL entries and group members naming
+	// what the backup does not hold. Empty means DanglingDrop.
+	Dangling Dangling
 }
 
 // Report says what a restore did.
@@ -39,11 +42,6 @@ type Report struct {
 }
 
 func (r *Report) add(kind string) { r.mu.Lock(); r.Restored[kind]++; r.mu.Unlock() }
-func (r *Report) warn(w format.Warning) {
-	r.mu.Lock()
-	r.Warnings = append(r.Warnings, w)
-	r.mu.Unlock()
-}
 
 // usag matches the per-user groups a server creates when a user joins an
 // org: they are named after the user's internal id, which a target assigns
@@ -63,12 +61,22 @@ func ToAPI(ctx context.Context, r *format.Reader, c *cinc.Client, opts Options) 
 	if n <= 0 {
 		n = 8
 	}
+	mode := opts.Dangling
+	if mode == "" {
+		mode = DanglingDrop
+	}
 	rs := &restorer{r: r, c: c, n: n, super: c.ClientName(), rep: &Report{Restored: map[string]int{}}}
+	rs.refs = rs.known()
 	orgs := rs.orgs()
 	users := rs.users()
 	if err := rs.preflight(ctx, orgs, users); err != nil {
 		return nil, err
 	}
+	warns, err := rs.resolve(ctx, mode)
+	if err != nil {
+		return nil, err
+	}
+	rs.rep.Warnings = warns
 	if err := rs.each(ctx, users, rs.user); err != nil {
 		return rs.rep, err
 	}
@@ -92,6 +100,7 @@ type restorer struct {
 	n     int
 	super string
 	rep   *Report
+	refs  *known
 }
 
 // each runs fn for every item, at most n at a time, and returns the first
@@ -474,23 +483,12 @@ func (rs *restorer) groups(ctx context.Context, o string) error {
 		}
 		var target map[string]any
 		_ = json.Unmarshal(cur, &target)
-		groups := []string{}
-		for _, sub := range stringsOf(doc["groups"]) {
-			if !usag.MatchString(sub) {
-				groups = append(groups, sub)
-			}
-		}
+		// Dangling names were reported by resolve.
+		users, clients, groups, _ := rs.refs.members(o, doc)
 		for _, sub := range stringsOf(target["groups"]) {
 			if usag.MatchString(sub) {
 				groups = append(groups, sub)
 			}
-		}
-		users, clients := stringsOf(doc["users"]), stringsOf(doc["clients"])
-		if users == nil {
-			users = []string{}
-		}
-		if clients == nil {
-			clients = []string{}
 		}
 		b, _ := json.Marshal(map[string]any{"groupname": g, "actors": map[string]any{"users": users, "clients": clients, "groups": groups}})
 		if _, err := rs.do(ctx, "PUT", base+"/"+esc(g), b, "1"); err != nil {
@@ -717,10 +715,10 @@ func (rs *restorer) policies(ctx context.Context, o string) error {
 
 var perms = []string{"create", "read", "update", "delete", "grant"}
 
-// putACL writes each permission of the ACL stored at p to base/_acl/<perm>.
-// The per-user groups the backup names are left out, with a warning: the
-// target names them after ids it assigned itself.
-func (rs *restorer) putACL(ctx context.Context, p, base string) error {
+// putACL writes each permission of the ACL stored at p, for an object of org
+// o ("" for a user's own ACL), to base/_acl/<perm>. Per-user groups and
+// dangling names are left out; resolve has already reported them.
+func (rs *restorer) putACL(ctx context.Context, p, base, o string) error {
 	acl, err := rs.object(p)
 	if err != nil {
 		return err
@@ -730,24 +728,7 @@ func (rs *restorer) putACL(ctx context.Context, p, base string) error {
 		if !ok {
 			continue
 		}
-		groups := []string{}
-		for _, g := range stringsOf(ace["groups"]) {
-			if usag.MatchString(g) {
-				rs.rep.warn(format.Warning{Code: "acl.usag_dropped", Path: p, Detail: perm + ": per-user group " + g})
-				continue
-			}
-			groups = append(groups, g)
-		}
-		out := map[string]any{"actors": nonNil(stringsOf(ace["actors"])), "groups": groups}
-		// The granular form names users and clients apart; send it so a
-		// user and a client with the same name stay distinct.
-		users, uok := ace["users"]
-		clients, cok := ace["clients"]
-		if uok || cok {
-			out["actors"] = []string{}
-			out["users"] = nonNil(stringsOf(users))
-			out["clients"] = nonNil(stringsOf(clients))
-		}
+		out, _, _ := rs.refs.ace(o, ace)
 		b, _ := json.Marshal(map[string]any{perm: out})
 		if _, err := rs.do(ctx, "PUT", base+"/_acl/"+perm, b, "1"); err != nil {
 			return err
@@ -757,35 +738,18 @@ func (rs *restorer) putACL(ctx context.Context, p, base string) error {
 	return nil
 }
 
-func nonNil(s []string) []string {
-	if s == nil {
-		return []string{}
-	}
-	return s
-}
-
 func (rs *restorer) acls(ctx context.Context, o string) error {
 	org := "/organizations/" + esc(o)
 	prefix := "orgs/" + o + "/acls/"
-	var paths []string
-	for _, p := range rs.r.Paths(prefix) {
-		if strings.Count(strings.TrimPrefix(p, prefix), "/") == 1 {
-			paths = append(paths, p)
-		}
-	}
-	if err := rs.each(ctx, paths, func(ctx context.Context, p string) error {
+	if err := rs.each(ctx, rs.aclPaths(o), func(ctx context.Context, p string) error {
 		typ, file := path.Split(strings.TrimPrefix(p, prefix))
 		name := strings.TrimSuffix(file, ".json")
-		typ = strings.TrimSuffix(typ, "/")
-		if typ == "groups" && usag.MatchString(name) {
-			return nil
-		}
-		return rs.putACL(ctx, p, org+"/"+typ+"/"+esc(name))
+		return rs.putACL(ctx, p, org+"/"+strings.TrimSuffix(typ, "/")+"/"+esc(name), o)
 	}); err != nil {
 		return err
 	}
 	if _, ok := rs.r.Entry("orgs/" + o + "/acl.json"); ok {
-		return rs.putACL(ctx, "orgs/"+o+"/acl.json", org+"/organizations")
+		return rs.putACL(ctx, "orgs/"+o+"/acl.json", org+"/organizations", o)
 	}
 	return nil
 }
@@ -795,5 +759,5 @@ func (rs *restorer) userACL(ctx context.Context, u string) error {
 	if _, ok := rs.r.Entry(p); !ok {
 		return nil
 	}
-	return rs.putACL(ctx, p, "/users/"+esc(u))
+	return rs.putACL(ctx, p, "/users/"+esc(u), "")
 }

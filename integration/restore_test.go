@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -315,5 +316,148 @@ func TestRestoreRefusesNonEmptyTarget(t *testing.T) {
 	_, err := restore.ToAPI(context.Background(), ra, b.client(t, ""), restore.Options{})
 	if err == nil || !strings.Contains(err.Error(), "acme") {
 		t.Fatalf("err = %v, want a refusal naming org acme", err)
+	}
+}
+
+// edit returns a copy of r with fn applied to every object's bytes.
+func edit(t *testing.T, r *format.Reader, fn func(path string, data []byte) []byte) *format.Reader {
+	t.Helper()
+	var buf bytes.Buffer
+	m := r.Manifest()
+	w := format.NewWriter(&buf, m.Source)
+	for _, warn := range m.Warnings {
+		w.Warn(warn)
+	}
+	for _, e := range m.Entries {
+		if strings.HasPrefix(e.Path, "blobs/") {
+			sum := filepath.Base(e.Path)
+			rc, err := r.Blob(sum)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = w.PutBlob(sum, rc)
+			_ = rc.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		data, err := r.Object(e.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		meta := format.Meta{Source: e.Source, APIVersion: e.APIVersion, FetchedAt: e.FetchedAt}
+		if err := w.PutObject(e.Path, fn(e.Path, data), meta); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out, err := format.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// withDangling backs up a seeded server, then makes web01's update ACL name
+// the user ghost and the client gone01, and devs name the user ghost, as a
+// backup of a server where they were deleted after being granted access.
+func withDangling(t *testing.T) *format.Reader {
+	t.Helper()
+	a := startNG(t, "acme")
+	seed(t, a)
+	seedExtras(t, a)
+	return edit(t, backupBytes(t, a), func(p string, data []byte) []byte {
+		add := func(m map[string]any, key, name string) {
+			l, _ := m[key].([]any)
+			m[key] = append(l, name)
+		}
+		var m map[string]any
+		switch p {
+		case "orgs/acme/acls/nodes/web01.json":
+			_ = json.Unmarshal(data, &m)
+			ace := m["update"].(map[string]any)
+			add(ace, "users", "ghost")
+			add(ace, "clients", "gone01")
+		case "orgs/acme/groups/devs.json":
+			_ = json.Unmarshal(data, &m)
+			add(m, "users", "ghost")
+		default:
+			return data
+		}
+		out, _ := json.Marshal(m)
+		return out
+	})
+}
+
+// By default restore leaves dangling names out, restores the rest of each
+// ACL and group, and reports every name it dropped.
+func TestRestoreDropsDanglingNames(t *testing.T) {
+	b := startNG(t, "unused")
+	rep := restoreInto(t, withDangling(t), b)
+
+	var got []string
+	for _, w := range rep.Warnings {
+		if strings.Contains(w.Code, "dangling") {
+			got = append(got, w.Code+" "+w.Path+" "+w.Detail)
+		}
+	}
+	want := []string{
+		"acl.dangling_dropped orgs/acme/acls/nodes/web01.json update: user ghost",
+		"acl.dangling_dropped orgs/acme/acls/nodes/web01.json update: client gone01",
+		"group.dangling_dropped orgs/acme/groups/devs.json user ghost",
+	}
+	sort.Strings(got)
+	sort.Strings(want)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("dangling warnings:\n got %q\nwant %q", got, want)
+	}
+
+	c := b.client(t, "")
+	ctx := context.Background()
+	data, _, err := c.Do(ctx, "GET", "/organizations/acme/nodes/web01/_acl?detail=granular", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var acl map[string]map[string]any
+	if err := json.Unmarshal(data, &acl); err != nil {
+		t.Fatal(err)
+	}
+	upd := acl["update"]
+	if u := sortedStrings(upd["users"]); !reflect.DeepEqual(u, []string{"alice"}) {
+		t.Errorf("web01 update users = %v, want [alice]", u)
+	}
+	if g := sortedStrings(upd["groups"]); !reflect.DeepEqual(g, []string{"admins", "devs"}) {
+		t.Errorf("web01 update groups = %v, want [admins devs]", g)
+	}
+	data, _, err = c.Do(ctx, "GET", "/organizations/acme/groups/devs", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var devs map[string]any
+	_ = json.Unmarshal(data, &devs)
+	if u := sortedStrings(devs["users"]); !reflect.DeepEqual(u, []string{"alice"}) {
+		t.Errorf("devs users = %v, want [alice]", u)
+	}
+}
+
+// --dangling=fail names every dangling reference and writes nothing.
+func TestRestoreDanglingFailWritesNothing(t *testing.T) {
+	b := startNG(t, "unused")
+	_, err := restore.ToAPI(context.Background(), withDangling(t), b.client(t, ""), restore.Options{Dangling: restore.DanglingFail})
+	if err == nil {
+		t.Fatal("restore succeeded; want a refusal")
+	}
+	for _, s := range []string{"3 users, clients or groups", "nodes/web01.json: update: user ghost", "client gone01", "groups/devs.json: user ghost"} {
+		if !strings.Contains(err.Error(), s) {
+			t.Errorf("error does not mention %q:\n%v", s, err)
+		}
+	}
+	for _, p := range []string{"/organizations/acme", "/users/alice"} {
+		if _, _, err := b.client(t, "").Do(context.Background(), "GET", p, nil); !errors.Is(err, cinc.ErrNotFound) {
+			t.Errorf("GET %s after a refused restore: err = %v, want not found", p, err)
+		}
 	}
 }
