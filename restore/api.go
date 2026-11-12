@@ -291,6 +291,11 @@ func (rs *restorer) user(ctx context.Context, u string) error {
 		if err != nil {
 			return err
 		}
+		if same {
+			if same, err = rs.sameLogin(ctx, u, dir); err != nil {
+				return err
+			}
+		}
 		if !same {
 			rs.track.stranger("users/" + u)
 			rs.rep.warn(format.Warning{Code: "merge.different_user", Path: dir + ".json",

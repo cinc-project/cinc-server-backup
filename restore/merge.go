@@ -310,3 +310,25 @@ func names(v any) []string {
 	}
 	return stringsOf(v)
 }
+
+// sameLogin reports whether the target's user u signs in through the same
+// external identity (external_authentication_uid, the SSO/LDAP login) as the
+// backup's user at dir. Keys can't show who a login belongs to, but a different
+// external identity means a different person. A password can't be compared:
+// the API doesn't expose its hash.
+func (rs *restorer) sameLogin(ctx context.Context, u, dir string) (bool, error) {
+	backup, err := rs.object(dir + ".json")
+	if err != nil {
+		return false, err
+	}
+	data, err := rs.do(ctx, "GET", "/users/"+esc(u), nil, "1")
+	if err != nil {
+		return false, err
+	}
+	var target map[string]any
+	if err := json.Unmarshal(data, &target); err != nil {
+		return false, fmt.Errorf("decode /users/%s: %w", u, err)
+	}
+	uid := func(m map[string]any) string { s, _ := m["external_authentication_uid"].(string); return s }
+	return uid(backup) == uid(target), nil
+}

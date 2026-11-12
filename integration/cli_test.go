@@ -435,3 +435,65 @@ func TestCLIMergeSkipMatchingOneKeyIsNotEnough(t *testing.T) {
 		t.Error("the other alice was made a member of acme")
 	}
 }
+
+// Matching keys aren't enough for a user who signs in as someone else: a
+// different external login (SSO/LDAP uid) makes the target's alice a stranger,
+// even with exactly the backup alice's keys.
+func TestCLIMergeSkipDifferentExternalLogin(t *testing.T) {
+	a := startNG(t, "acme")
+	seed(t, a)
+	env := cliEnv{t, t.TempDir()}
+	file := filepath.Join(env.dir, "chef.csb")
+	if code, out := env.run("backup", "--server", a.url, "--user", a.admin, "--key", env.key("a", a), "-o", file); code != 0 {
+		t.Fatalf("backup = %d:\n%s", code, out)
+	}
+	ctx := context.Background()
+	data, _, err := a.client(t, "").Do(ctx, "GET", "/users/alice/keys/default", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var k struct {
+		PublicKey string `json:"public_key"`
+	}
+	if err := json.Unmarshal(data, &k); err != nil {
+		t.Fatal(err)
+	}
+
+	newTarget := func(uid string) *ngServer {
+		b := startNG(t, "unused")
+		doc := map[string]string{
+			"username": "alice", "email": "other@example.com", "first_name": "O", "last_name": "A",
+			"display_name": "Other Alice", "password": "sekrit123", "public_key": k.PublicKey,
+		}
+		if uid != "" {
+			doc["external_authentication_uid"] = uid
+		}
+		body, _ := json.Marshal(doc)
+		if _, _, err := b.client(t, "").Do(ctx, "POST", "/users", body); err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+
+	// Exactly the backup's keys and no external login: the same alice. She joins
+	// acme; her own user document is left as it is, and is the one difference.
+	same := newTarget("")
+	code, out := env.run("restore", file, "--server", same.url, "--user", same.admin, "--key", env.key("same", same), "--merge", "skip")
+	diffs := regexp.MustCompile(`(?m)^(missing|changed)\s+(\S+)`).FindAllStringSubmatch(out, -1)
+	if code != 1 || strings.Contains(out, "merge.different_user") || len(diffs) != 1 || diffs[0][2] != "server/users/alice.json" {
+		t.Fatalf("restore with a matching alice = %d, want 1 with her user document the only difference and no warning:\n%s", code, out)
+	}
+	if _, _, err := same.client(t, "").Do(ctx, "GET", "/organizations/acme/users/alice", nil); err != nil {
+		t.Errorf("the matching alice was not made a member of acme: %v", err)
+	}
+
+	// The same keys, but she signs in as someone else.
+	other := newTarget("someone-else")
+	code, out = env.run("restore", file, "--server", other.url, "--user", other.admin, "--key", env.key("other", other), "--merge", "skip")
+	if code != 1 || !strings.Contains(out, "merge.different_user") {
+		t.Fatalf("restore = %d, want 1 with a different_user warning:\n%s", code, out)
+	}
+	if _, _, err := other.client(t, "").Do(ctx, "GET", "/organizations/acme/users/alice", nil); err == nil {
+		t.Error("the other alice was made a member of acme")
+	}
+}
