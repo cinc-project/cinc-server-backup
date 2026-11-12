@@ -10,7 +10,8 @@
 # was deleted; ng removes the names, so its backups never have them). Restore
 # into another fresh server must refuse it with --dangling fail and write
 # nothing, then with the default (drop) report exactly the injected names and
-# produce the same server as the clean backup.
+# produce the same server as the clean backup. verify --server must exit 0
+# for the clean target and 3 (everything but the dropped names) for this one.
 #
 # Exits non-zero on the first failure, including any difference.
 #
@@ -78,6 +79,9 @@ echo "== backing up the source"
 echo "== restoring into the target"
 "$csb" restore "$work/source.csb" --server "http://127.0.0.1:$dst_port" --key "$work/keys/dst.pem"
 
+echo "== verify --server: the target must hold everything (exit 0)"
+"$csb" verify "$work/source.csb" --server "http://127.0.0.1:$dst_port" --key "$work/keys/dst.pem"
+
 echo "== backing up the target and comparing"
 "$csb" backup --server "http://127.0.0.1:$dst_port" --key "$work/keys/dst.pem" -o "$work/target.csb"
 "$csb" diff "$work/source.csb" "$work/target.csb"
@@ -103,6 +107,17 @@ echo "== the default (drop) must leave out exactly the injected names"
   | tee "$work/drop.out"
 awk '/dangling_dropped/ {print $1, $2, $3, $4, $5}' "$work/drop.out" | sed 's/ *$//' | sort >"$work/dangling.got"
 diff -u "$work/dangling.want" "$work/dangling.got"
+
+echo "== verify --server: everything but the dropped names (exit 3)"
+set +e
+"$csb" verify "$work/dangling.csb" --server "http://127.0.0.1:$dangle_port" --key "$work/keys/dangle.pem" | tee "$work/verify.out"
+code=${PIPESTATUS[0]}
+set -e
+if [[ $code -ne 3 ]]; then
+  echo "verify exited $code; want 3" >&2
+  exit 1
+fi
+grep -Eq 'dropped +3 ' "$work/verify.out"
 
 echo "== the result must match the clean backup"
 "$csb" backup --server "http://127.0.0.1:$dangle_port" --key "$work/keys/dangle.pem" -o "$work/dangle-target.csb"

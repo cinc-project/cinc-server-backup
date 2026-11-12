@@ -13,7 +13,6 @@ import (
 	"io"
 	"net/url"
 	"path"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -21,6 +20,7 @@ import (
 	cinc "github.com/cinc-project/cinc-api"
 
 	"github.com/cinc-project/cinc-server-backup/format"
+	"github.com/cinc-project/cinc-server-backup/internal/refs"
 )
 
 // Options tune a restore.
@@ -43,10 +43,7 @@ type Report struct {
 
 func (r *Report) add(kind string) { r.mu.Lock(); r.Restored[kind]++; r.mu.Unlock() }
 
-// usag matches the per-user groups a server creates when a user joins an
-// org: they are named after the user's internal id, which a target assigns
-// afresh, so they are recreated by association rather than restored.
-var usag = regexp.MustCompile(`^[0-9a-f]{32}$`)
+var usag = refs.USAG
 
 // ToAPI restores everything in r into the server c talks to. c must sign as
 // a superuser; that superuser itself is left as the target has it. The
@@ -66,7 +63,7 @@ func ToAPI(ctx context.Context, r *format.Reader, c *cinc.Client, opts Options) 
 		mode = DanglingDrop
 	}
 	rs := &restorer{r: r, c: c, n: n, super: c.ClientName(), rep: &Report{Restored: map[string]int{}}}
-	rs.refs = rs.known()
+	rs.refs = refs.FromBackup(r, rs.super)
 	orgs := rs.orgs()
 	users := rs.users()
 	if err := rs.preflight(ctx, orgs, users); err != nil {
@@ -100,7 +97,7 @@ type restorer struct {
 	n     int
 	super string
 	rep   *Report
-	refs  *known
+	refs  *refs.Known
 }
 
 // each runs fn for every item, at most n at a time, and returns the first
@@ -484,7 +481,7 @@ func (rs *restorer) groups(ctx context.Context, o string) error {
 		var target map[string]any
 		_ = json.Unmarshal(cur, &target)
 		// Dangling names were reported by resolve.
-		users, clients, groups, _ := rs.refs.members(o, doc)
+		users, clients, groups, _ := rs.refs.Members(o, doc)
 		for _, sub := range stringsOf(target["groups"]) {
 			if usag.MatchString(sub) {
 				groups = append(groups, sub)
@@ -728,7 +725,7 @@ func (rs *restorer) putACL(ctx context.Context, p, base, o string) error {
 		if !ok {
 			continue
 		}
-		out, _, _ := rs.refs.ace(o, ace)
+		out, _, _ := rs.refs.ACE(o, ace)
 		b, _ := json.Marshal(map[string]any{perm: out})
 		if _, err := rs.do(ctx, "PUT", base+"/_acl/"+perm, b, "1"); err != nil {
 			return err

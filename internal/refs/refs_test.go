@@ -1,4 +1,4 @@
-package restore
+package refs
 
 import (
 	"reflect"
@@ -6,8 +6,8 @@ import (
 	"testing"
 )
 
-func testKnown() *known {
-	return &known{
+func testKnown() *Known {
+	return &Known{
 		users:   setOf([]string{"alice", "pivotal"}),
 		clients: map[string]nameSet{"acme": setOf([]string{"web01", "alice"})},
 		groups:  map[string]nameSet{"acme": setOf([]string{"admins", "devs"})},
@@ -25,7 +25,7 @@ func list(s ...string) []any {
 const usagName = "0123456789abcdef0123456789abcdef"
 
 func TestACEDropsDanglingGranularNames(t *testing.T) {
-	out, usags, dangling := testKnown().ace("acme", map[string]any{
+	out, usags, dangling := testKnown().ACE("acme", map[string]any{
 		"actors":  list(),
 		"users":   list("alice", "ghost"),
 		"clients": list("web01", "gone01", "pivotal"),
@@ -50,7 +50,7 @@ func TestACEDropsDanglingGranularNames(t *testing.T) {
 }
 
 func TestACEUntypedActorsMatchUsersOrClients(t *testing.T) {
-	out, _, dangling := testKnown().ace("acme", map[string]any{
+	out, _, dangling := testKnown().ACE("acme", map[string]any{
 		"actors": list("alice", "web01", "ghost"),
 		"groups": list(),
 	})
@@ -68,7 +68,7 @@ func TestACEUntypedActorsMatchUsersOrClients(t *testing.T) {
 // A user's own ACL lives outside any org: its actors are users only, and
 // the server does not check its groups.
 func TestACEOfUserACLChecksUsersOnly(t *testing.T) {
-	out, _, dangling := testKnown().ace("", map[string]any{
+	out, _, dangling := testKnown().ACE("", map[string]any{
 		"actors": list("alice", "web01"),
 		"groups": list("whatever"),
 	})
@@ -84,7 +84,7 @@ func TestACEOfUserACLChecksUsersOnly(t *testing.T) {
 }
 
 func TestMembersDropDanglingNamesAndUSAGs(t *testing.T) {
-	users, clients, groups, dangling := testKnown().members("acme", map[string]any{
+	users, clients, groups, dangling := testKnown().Members("acme", map[string]any{
 		"users":   list("alice", "ghost"),
 		"clients": list("gone01"),
 		"groups":  list("devs", usagName, "ops"),
@@ -97,13 +97,10 @@ func TestMembersDropDanglingNamesAndUSAGs(t *testing.T) {
 	}
 }
 
-func TestParseDangling(t *testing.T) {
-	for _, s := range []string{"drop", "fail"} {
-		if _, err := ParseDangling(s); err != nil {
-			t.Errorf("ParseDangling(%q): %v", s, err)
-		}
+func setOf(names []string) nameSet {
+	s := nameSet{}
+	for _, n := range names {
+		s[n] = true
 	}
-	if _, err := ParseDangling("keep"); err == nil {
-		t.Error("ParseDangling(keep) accepted")
-	}
+	return s
 }
