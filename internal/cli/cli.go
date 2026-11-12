@@ -222,6 +222,7 @@ type restoreFlags struct {
 	server, user, key string
 	concurrency       int
 	blobHosts         []string
+	dangling          string
 }
 
 func newRestoreCmd() *cobra.Command {
@@ -241,9 +242,18 @@ and finally the ACLs.
 
 Clients and users keep their public keys, so existing client.pem and
 validation.pem files work against the new server. Passwords can't be carried
-over the API: restored users get a random one until they reset it.`,
+over the API: restored users get a random one until they reset it.
+
+An ACL entry or group member can name a user, client or group the backup
+doesn't hold, such as a user deleted after being granted access to a node.
+A server refuses a whole ACL that names one, so by default (--dangling=drop)
+restore leaves those names out and lists each one. --dangling=fail lists
+them and stops before writing anything.`,
 		Example: `Restore a backup into a new, empty server.
-cinc-server-backup restore chef.csb --server https://new-chef.example.com --key pivotal.pem`,
+cinc-server-backup restore chef.csb --server https://new-chef.example.com --key pivotal.pem
+
+Stop instead if any ACL or group names a user, client or group the backup lacks.
+cinc-server-backup restore chef.csb --server https://new-chef.example.com --key pivotal.pem --dangling fail`,
 		Args: exactlyOneBackup,
 		RunE: func(cmd *cobra.Command, args []string) error { return runRestore(cmd, args[0], f) },
 	}
@@ -253,10 +263,15 @@ cinc-server-backup restore chef.csb --server https://new-chef.example.com --key 
 	fl.StringVar(&f.key, "key", "", "path to that superuser's private key (required)")
 	fl.IntVar(&f.concurrency, "concurrency", 8, "most requests to have in flight at once")
 	fl.StringArrayVar(&f.blobHosts, "blob-host", nil, "extra host[:port] file uploads may be redirected to, such as an S3 bookshelf (repeatable)")
+	fl.StringVar(&f.dangling, "dangling", string(restore.DanglingDrop), "what to do with ACL entries and group members the backup can't resolve: drop or fail")
 	return cmd
 }
 
 func runRestore(cmd *cobra.Command, file string, f restoreFlags) error {
+	dangling, err := restore.ParseDangling(f.dangling)
+	if err != nil {
+		return usagef("%v", err)
+	}
 	var missing []string
 	for _, req := range []struct{ name, val string }{{"--server", f.server}, {"--key", f.key}} {
 		if req.val == "" {
@@ -280,7 +295,7 @@ func runRestore(cmd *cobra.Command, file string, f restoreFlags) error {
 	}
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
 	defer stop()
-	rep, err := restore.ToAPI(ctx, r, c, restore.Options{Concurrency: f.concurrency})
+	rep, err := restore.ToAPI(ctx, r, c, restore.Options{Concurrency: f.concurrency, Dangling: dangling})
 	if rep != nil {
 		printReport(cmd.OutOrStdout(), rep)
 	}
