@@ -30,6 +30,10 @@ type Options struct {
 	// Dangling says what to do with ACL entries and group members naming
 	// what the backup does not hold. Empty means DanglingDrop.
 	Dangling Dangling
+	// Orgs restores only these organizations (all when empty), and
+	// ExcludeOrgs leaves these out. The users the restored orgs name come
+	// along: members, invitees, group members and ACL entries.
+	Orgs, ExcludeOrgs []string
 }
 
 // Report says what a restore did.
@@ -47,7 +51,7 @@ var usag = refs.USAG
 
 // ToAPI restores everything in r into the server c talks to. c must sign as
 // a superuser; that superuser itself is left as the target has it. The
-// target must not already hold any of the backup's organizations or users.
+// target must not already hold any of the organizations or users it restores.
 //
 // Objects are written in dependency order: users and their keys, orgs and
 // membership, then per org containers, clients and keys, groups, objects,
@@ -63,6 +67,11 @@ func ToAPI(ctx context.Context, r *format.Reader, c *cinc.Client, opts Options) 
 		mode = DanglingDrop
 	}
 	rs := &restorer{r: r, c: c, n: n, super: c.ClientName(), rep: &Report{Restored: map[string]int{}}}
+	sel, err := refs.Select(r, opts.Orgs, opts.ExcludeOrgs)
+	if err != nil {
+		return nil, err
+	}
+	rs.sel = sel
 	rs.refs = refs.FromBackup(r, rs.super)
 	orgs := rs.orgs()
 	users := rs.users()
@@ -98,6 +107,7 @@ type restorer struct {
 	super string
 	rep   *Report
 	refs  *refs.Known
+	sel   *refs.Selection
 }
 
 // each runs fn for every item, at most n at a time, and returns the first
@@ -171,20 +181,12 @@ func (rs *restorer) names(dir string) []string {
 	return out
 }
 
-func (rs *restorer) orgs() []string {
-	var out []string
-	for _, p := range rs.r.Paths("orgs/") {
-		segs := strings.Split(p, "/")
-		if len(segs) == 3 && segs[2] == "org.json" {
-			out = append(out, segs[1])
-		}
-	}
-	return out
-}
+func (rs *restorer) orgs() []string { return rs.sel.Orgs }
 
+// users lists the selected users but the target's own superuser.
 func (rs *restorer) users() []string {
 	var out []string
-	for _, u := range rs.names("server/users/") {
+	for _, u := range rs.sel.Users {
 		if u != rs.super {
 			out = append(out, u)
 		}

@@ -16,10 +16,12 @@ import (
 
 	cinc "github.com/cinc-project/cinc-api"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"github.com/cinc-project/cinc-server-backup/capture"
 	"github.com/cinc-project/cinc-server-backup/compare"
 	"github.com/cinc-project/cinc-server-backup/format"
+	"github.com/cinc-project/cinc-server-backup/internal/refs"
 	"github.com/cinc-project/cinc-server-backup/restore"
 )
 
@@ -229,6 +231,7 @@ type restoreFlags struct {
 	blobHosts         []string
 	dangling          string
 	noVerify          bool
+	orgs, excludeOrgs []string
 }
 
 func newRestoreCmd() *cobra.Command {
@@ -256,6 +259,10 @@ A server refuses a whole ACL that names one, so by default (--dangling=drop)
 restore leaves those names out and lists each one. --dangling=fail lists
 them and stops before writing anything.
 
+--org restores only the organizations you name, and --exclude-org leaves
+some out. The users those organizations name come along: members, invitees,
+group members, ACL entries, and the users named in those users' own ACLs.
+
 Once everything is written, restore checks the result as verify --server
 does: it backs the target up into a temporary file, compares it with the
 backup and prints the fidelity report. --no-verify skips that.
@@ -265,6 +272,9 @@ holds everything but the dangling names it left out, and 1 on any failure
 or difference.`,
 		Example: `Restore a backup into a new, empty server.
 cinc-server-backup restore chef.csb --server https://new-chef.example.com --key pivotal.pem
+
+Restore one organization, and the users it names, out of a whole-server backup.
+cinc-server-backup restore chef.csb --server https://new-chef.example.com --key pivotal.pem --org acme
 
 Stop instead if any ACL or group names a user, client or group the backup lacks.
 cinc-server-backup restore chef.csb --server https://new-chef.example.com --key pivotal.pem --dangling fail`,
@@ -279,6 +289,7 @@ cinc-server-backup restore chef.csb --server https://new-chef.example.com --key 
 	fl.StringArrayVar(&f.blobHosts, "blob-host", nil, "extra host[:port] file uploads may be redirected to, such as an S3 bookshelf (repeatable)")
 	fl.StringVar(&f.dangling, "dangling", string(restore.DanglingDrop), "what to do with ACL entries and group members the backup can't resolve: drop or fail")
 	fl.BoolVar(&f.noVerify, "no-verify", false, "don't back the target up and compare it with the backup afterwards")
+	orgFlags(fl, &f.orgs, &f.excludeOrgs)
 	return cmd
 }
 
@@ -304,14 +315,20 @@ func runRestore(cmd *cobra.Command, file string, f restoreFlags) error {
 	if err := r.Verify(); err != nil {
 		return fmt.Errorf("the backup failed its checksum check, so we won't restore it: %w", err)
 	}
+	out := cmd.OutOrStdout()
+	sel, err := selection(out, r, f.orgs, f.excludeOrgs)
+	if err != nil {
+		return err
+	}
 	c, err := newClient(f.server, f.user, f.key, f.blobHosts)
 	if err != nil {
 		return err
 	}
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
 	defer stop()
-	rep, err := restore.ToAPI(ctx, r, c, restore.Options{Concurrency: f.concurrency, Dangling: dangling})
-	out := cmd.OutOrStdout()
+	rep, err := restore.ToAPI(ctx, r, c, restore.Options{
+		Concurrency: f.concurrency, Dangling: dangling, Orgs: sel.Orgs,
+	})
 	if rep != nil {
 		printReport(out, rep)
 	}
@@ -322,7 +339,7 @@ func runRestore(cmd *cobra.Command, file string, f restoreFlags) error {
 		return nil
 	}
 	fmt.Fprintln(out)
-	return checkServer(ctx, out, r, file, f.server, f.user, c, capture.Options{Concurrency: f.concurrency, BlobHosts: f.blobHosts})
+	return checkServer(ctx, out, r, sel, file, f.server, f.user, c, capture.Options{Concurrency: f.concurrency, BlobHosts: f.blobHosts})
 }
 
 func printReport(out io.Writer, rep *restore.Report) {
@@ -419,6 +436,7 @@ type verifyFlags struct {
 	server, user, key string
 	concurrency       int
 	blobHosts         []string
+	orgs, excludeOrgs []string
 }
 
 func newVerifyCmd() *cobra.Command {
@@ -463,7 +481,27 @@ cinc-server-backup verify chef.csb --server https://new-chef.example.com --key p
 	fl.StringVar(&f.key, "key", "", "path to that superuser's private key (required with --server)")
 	fl.IntVar(&f.concurrency, "concurrency", 8, "most requests to have in flight at once")
 	fl.StringArrayVar(&f.blobHosts, "blob-host", nil, "extra host[:port] cookbook files may come from, such as an S3 bookshelf (repeatable)")
+	orgFlags(fl, &f.orgs, &f.excludeOrgs)
 	return cmd
+}
+
+// orgFlags adds --org and --exclude-org, which pick part of a backup.
+func orgFlags(fl *pflag.FlagSet, orgs, exclude *[]string) {
+	fl.StringSliceVar(orgs, "org", nil, "only these organizations, and the users they name (comma-separated or repeated)")
+	fl.StringSliceVar(exclude, "exclude-org", nil, "leave these organizations out (comma-separated or repeated)")
+}
+
+// selection picks the part of r --org and --exclude-org name, and says
+// which orgs and users that is when it is not everything.
+func selection(out io.Writer, r *format.Reader, orgs, exclude []string) (*refs.Selection, error) {
+	sel, err := refs.Select(r, orgs, exclude)
+	if err != nil {
+		return nil, usageError{err}
+	}
+	if !sel.All {
+		fmt.Fprintf(out, "selected orgs: %s\nwith the users they name: %s\n", strings.Join(sel.Orgs, ", "), strings.Join(sel.Users, ", "))
+	}
+	return sel, nil
 }
 
 // errDropped is verify's "everything but the dangling names" result: exit 3
@@ -488,7 +526,14 @@ func runVerify(cmd *cobra.Command, file string, f verifyFlags) error {
 	out := cmd.OutOrStdout()
 	fmt.Fprintf(out, "ok: %d entries verified\n", len(r.Manifest().Entries))
 	if f.server == "" {
+		if len(f.orgs) > 0 || len(f.excludeOrgs) > 0 {
+			return usagef("--org and --exclude-org need --server")
+		}
 		return nil
+	}
+	sel, err := selection(out, r, f.orgs, f.excludeOrgs)
+	if err != nil {
+		return err
 	}
 
 	opts := capture.Options{Concurrency: f.concurrency, BlobHosts: f.blobHosts}
@@ -498,15 +543,16 @@ func runVerify(cmd *cobra.Command, file string, f verifyFlags) error {
 	}
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
 	defer stop()
-	return checkServer(ctx, out, r, file, f.server, f.user, c, opts)
+	return checkServer(ctx, out, r, sel, file, f.server, f.user, c, opts)
 }
 
 // checkServer backs up the server c talks to into a temporary file (0600,
 // removed afterwards), compares it with the backup r read from file, leaving
-// out the superuser c signs as, and prints the fidelity report. It returns
+// out the superuser c signs as and anything outside sel, and prints the
+// fidelity report. It returns
 // errDifferent if anything differs, errDropped if only dangling names are
 // missing, and nil if the server holds everything.
-func checkServer(ctx context.Context, out io.Writer, r *format.Reader, file, server, user string, c *cinc.Client, opts capture.Options) error {
+func checkServer(ctx context.Context, out io.Writer, r *format.Reader, sel *refs.Selection, file, server, user string, c *cinc.Client, opts capture.Options) error {
 	tmp, err := os.CreateTemp("", "csb-verify-*.csb") // created 0600
 	if err != nil {
 		return err
@@ -529,7 +575,7 @@ func checkServer(ctx context.Context, out io.Writer, r *format.Reader, file, ser
 	if err != nil {
 		return err
 	}
-	res, err := compare.Compare(r, live, compare.Options{SkipUsers: []string{user}})
+	res, err := compare.Compare(r, live, compare.Options{SkipUsers: []string{user}, Include: sel.Includes})
 	if err != nil {
 		return err
 	}

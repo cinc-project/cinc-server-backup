@@ -160,3 +160,59 @@ func TestCLIRestoreNoVerify(t *testing.T) {
 		t.Fatalf("restore --no-verify = %d, want 0 and no fidelity report:\n%s%s", code, o.String(), e.String())
 	}
 }
+
+// restore --org acme writes acme and the users it names, and nothing of
+// beta; its own check compares only that part of the backup.
+func TestCLIRestoreOneOrg(t *testing.T) {
+	a := startNG(t, "acme", "beta")
+	seed(t, a)
+	ctx := context.Background()
+	ca := a.client(t, "")
+	for _, req := range [][2]string{
+		{"/users", `{"username":"bob","email":"bob@example.com","first_name":"B","last_name":"O","display_name":"Bob","password":"sekrit123","create_key":true}`},
+		{"/organizations/beta/users", `{"username":"bob"}`},
+		{"/organizations/beta/nodes", `{"name":"db01","json_class":"Chef::Node","chef_type":"node","chef_environment":"_default","run_list":[],"normal":{},"automatic":{},"default":{},"override":{}}`},
+	} {
+		if _, _, err := ca.Do(ctx, "POST", req[0], []byte(req[1])); err != nil {
+			t.Fatalf("POST %s: %v", req[0], err)
+		}
+	}
+	dir := t.TempDir()
+	keyA, keyB := filepath.Join(dir, "a.pem"), filepath.Join(dir, "b.pem")
+	_ = os.WriteFile(keyA, a.key, 0o600)
+	b := startNG(t, "unused")
+	_ = os.WriteFile(keyB, b.key, 0o600)
+	file := filepath.Join(dir, "chef.csb")
+	run := func(args ...string) (int, string) {
+		var o, e bytes.Buffer
+		code := cli.Run(args, &o, &e)
+		return code, o.String() + e.String()
+	}
+	if code, out := run("backup", "--server", a.url, "--user", a.admin, "--key", keyA, "-o", file); code != 0 {
+		t.Fatalf("backup = %d:\n%s", code, out)
+	}
+
+	code, out := run("restore", file, "--server", b.url, "--user", b.admin, "--key", keyB, "--org", "acme")
+	if code != 0 || !strings.Contains(out, "selected orgs: acme") || !regexp.MustCompile(`differences\s+0`).MatchString(out) {
+		t.Fatalf("restore --org acme = %d, want 0 with a clean report:\n%s", code, out)
+	}
+	cb := b.client(t, "")
+	for p, want := range map[string]bool{
+		"/organizations/acme/nodes/web01": true,
+		"/users/alice":                    true,
+		"/organizations/beta":             false,
+		"/users/bob":                      false,
+	} {
+		_, _, err := cb.Do(ctx, "GET", p, nil)
+		if got := err == nil; got != want {
+			t.Errorf("GET %s on the target: exists = %v, want %v (err %v)", p, got, want, err)
+		}
+	}
+	if code, out := run("verify", file, "--server", b.url, "--user", b.admin, "--key", keyB, "--exclude-org", "beta"); code != 0 {
+		t.Errorf("verify --exclude-org beta = %d, want 0:\n%s", code, out)
+	}
+	// The whole backup does not match: beta and bob are missing.
+	if code, _ := run("verify", file, "--server", b.url, "--user", b.admin, "--key", keyB); code != 1 {
+		t.Errorf("verify of the whole backup = %d, want 1", code)
+	}
+}

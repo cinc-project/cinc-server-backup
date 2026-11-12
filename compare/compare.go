@@ -33,6 +33,9 @@ type Options struct {
 	// SkipUsers are users left out, such as each server's own superuser,
 	// whose keys differ by design.
 	SkipUsers []string
+	// Include, when set, limits the comparison to the paths of a it
+	// accepts, such as the orgs a partial restore wrote.
+	Include func(path string) bool
 }
 
 // usag matches the per-user groups a server names after a user's internal
@@ -100,6 +103,9 @@ func Compare(a, b *format.Reader, opts Options) (*Result, error) {
 	}
 	for _, e := range a.Manifest().Entries {
 		p := e.Path
+		if opts.Include != nil && !opts.Include(p) {
+			continue
+		}
 		if skipped(p, skip) {
 			res.Skipped++
 			continue
