@@ -287,3 +287,66 @@ func tamper(t *testing.T, path, member string) {
 	_ = zw.Close()
 	_ = os.WriteFile(path, buf.Bytes(), 0o600)
 }
+
+// writeBackupWith writes a backup of objs (path -> JSON) and returns its path.
+func writeBackupWith(t *testing.T, objs map[string]string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "x.csb")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := format.NewWriter(f, format.Source{})
+	for p, data := range objs {
+		_ = w.PutObject(p, []byte(data), format.Meta{})
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	return path
+}
+
+func TestDiffEquivalentBackups(t *testing.T) {
+	a := writeBackupWith(t, map[string]string{
+		"server/users/pivotal.json": `{"username":"pivotal","k":"A"}`,
+		"orgs/acme/org.json":        `{"name":"acme","guid":"1"}`,
+	})
+	b := writeBackupWith(t, map[string]string{
+		"server/users/pivotal.json": `{"username":"pivotal","k":"B"}`,
+		"orgs/acme/org.json":        `{"name":"acme","guid":"2"}`,
+	})
+	code, out, errOut := run("diff", a, b)
+	if code != 0 || !strings.Contains(out, "No differences") {
+		t.Fatalf("diff = %d, out %q, err %q", code, out, errOut)
+	}
+	// pivotal is skipped by default; asking to skip nobody compares it.
+	if code, out, _ := run("diff", a, b, "--skip-user", ""); code != 1 || !strings.Contains(out, "server/users/pivotal.json") {
+		t.Fatalf("diff --skip-user '' = %d, out %q", code, out)
+	}
+}
+
+func TestDiffReportsDifferences(t *testing.T) {
+	a := writeBackupWith(t, map[string]string{
+		"orgs/acme/nodes/web01.json": `{"name":"web01","n":1}`,
+		"orgs/acme/roles/web.json":   `{"name":"web"}`,
+	})
+	b := writeBackupWith(t, map[string]string{
+		"orgs/acme/nodes/web01.json": `{"name":"web01","n":2}`,
+	})
+	code, out, _ := run("diff", a, b)
+	if code != 1 {
+		t.Fatalf("diff = %d, want 1", code)
+	}
+	for _, want := range []string{"changed", "orgs/acme/nodes/web01.json", "missing", "orgs/acme/roles/web.json", "2 differences"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("diff output lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestDiffNeedsTwoBackups(t *testing.T) {
+	if code, _, _ := run("diff", "a.csb"); code != 2 {
+		t.Fatalf("diff with one file = %d, want 2", code)
+	}
+}
