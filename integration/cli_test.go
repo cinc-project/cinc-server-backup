@@ -216,3 +216,117 @@ func TestCLIRestoreOneOrg(t *testing.T) {
 		t.Errorf("verify of the whole backup = %d, want 1", code)
 	}
 }
+
+// cliEnv runs the CLI against servers whose keys it writes to a temp dir.
+type cliEnv struct {
+	t   *testing.T
+	dir string
+}
+
+func (c cliEnv) key(name string, s *ngServer) string {
+	k := filepath.Join(c.dir, name+".pem")
+	if err := os.WriteFile(k, s.key, 0o600); err != nil {
+		c.t.Fatal(err)
+	}
+	return k
+}
+
+func (c cliEnv) run(args ...string) (int, string) {
+	var o, e bytes.Buffer
+	code := cli.Run(args, &o, &e)
+	return code, o.String() + e.String()
+}
+
+// Two orgs that share a user restore one at a time: the second needs
+// --merge skip, which keeps the shared user and adds the rest.
+func TestCLIRestoreSecondOrgSharingAUser(t *testing.T) {
+	a := startNG(t, "acme", "beta")
+	seed(t, a) // alice, a member of acme
+	ctx := context.Background()
+	ca := a.client(t, "")
+	for _, req := range [][2]string{
+		{"/organizations/beta/users", `{"username":"alice"}`},
+		{"/organizations/beta/nodes", `{"name":"db01","json_class":"Chef::Node","chef_type":"node","chef_environment":"_default","run_list":[],"normal":{},"automatic":{},"default":{},"override":{}}`},
+	} {
+		if _, _, err := ca.Do(ctx, "POST", req[0], []byte(req[1])); err != nil {
+			t.Fatalf("POST %s: %v", req[0], err)
+		}
+	}
+	env := cliEnv{t, t.TempDir()}
+	file := filepath.Join(env.dir, "chef.csb")
+	if code, out := env.run("backup", "--server", a.url, "--user", a.admin, "--key", env.key("a", a), "-o", file); code != 0 {
+		t.Fatalf("backup = %d:\n%s", code, out)
+	}
+	b := startNG(t, "unused")
+	keyB := env.key("b", b)
+	target := []string{"--server", b.url, "--user", b.admin, "--key", keyB}
+
+	if code, out := env.run(append([]string{"restore", file, "--org", "acme"}, target...)...); code != 0 {
+		t.Fatalf("restore --org acme = %d:\n%s", code, out)
+	}
+	code, out := env.run(append([]string{"restore", file, "--org", "beta"}, target...)...)
+	if code != 1 || !strings.Contains(out, "user alice") || !strings.Contains(out, "--merge skip") {
+		t.Fatalf("restore --org beta without --merge = %d, want 1 naming alice and suggesting --merge skip:\n%s", code, out)
+	}
+	code, out = env.run(append([]string{"restore", file, "--org", "beta", "--merge", "skip"}, target...)...)
+	if code != 0 || !regexp.MustCompile(`already on the target[\s\S]*users\s+1`).MatchString(out) {
+		t.Fatalf("restore --org beta --merge skip = %d, want 0 with alice skipped:\n%s", code, out)
+	}
+	if _, _, err := b.client(t, "").Do(ctx, "GET", "/organizations/beta/nodes/db01", nil); err != nil {
+		t.Errorf("beta's node missing: %v", err)
+	}
+	if code, out := env.run(append([]string{"verify", file}, target...)...); code != 0 {
+		t.Errorf("verify of the whole backup = %d, want 0:\n%s", code, out)
+	}
+}
+
+// A rerun with --merge skip puts back what is missing from the target and
+// leaves alone what it holds, reporting an object it holds differently.
+func TestCLIRestoreMergeSkipRerun(t *testing.T) {
+	a := startNG(t, "acme")
+	seed(t, a)
+	env := cliEnv{t, t.TempDir()}
+	file := filepath.Join(env.dir, "chef.csb")
+	if code, out := env.run("backup", "--server", a.url, "--user", a.admin, "--key", env.key("a", a), "-o", file); code != 0 {
+		t.Fatalf("backup = %d:\n%s", code, out)
+	}
+	b := startNG(t, "unused")
+	target := []string{"--server", b.url, "--user", b.admin, "--key", env.key("b", b)}
+	if code, out := env.run(append([]string{"restore", file}, target...)...); code != 0 {
+		t.Fatalf("restore = %d:\n%s", code, out)
+	}
+
+	// Lose some of the restore, and change a role.
+	ctx := context.Background()
+	cb := b.client(t, "")
+	for _, p := range []string{"/organizations/acme/nodes/web01", "/organizations/acme/data/secrets/db", "/organizations/acme/cookbooks/nginx/1.1.0"} {
+		if _, _, err := cb.Do(ctx, "DELETE", p, nil); err != nil {
+			t.Fatalf("DELETE %s: %v", p, err)
+		}
+	}
+	changed := `{"name":"web","json_class":"Chef::Role","chef_type":"role","run_list":["recipe[apache]"]}`
+	if _, _, err := cb.Do(ctx, "PUT", "/organizations/acme/roles/web", []byte(changed)); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out := env.run(append([]string{"restore", file, "--merge", "skip"}, target...)...)
+	if code != 1 {
+		t.Fatalf("rerun = %d, want 1 (the changed role):\n%s", code, out)
+	}
+	diffs := regexp.MustCompile(`(?m)^(missing|changed)\s+(\S+)`).FindAllStringSubmatch(out, -1)
+	if len(diffs) != 1 || diffs[0][2] != "orgs/acme/roles/web.json" {
+		t.Errorf("differences = %v, want only the changed role:\n%s", diffs, out)
+	}
+	for _, p := range []string{"/organizations/acme/nodes/web01", "/organizations/acme/data/secrets/db", "/organizations/acme/cookbooks/nginx/1.1.0"} {
+		if _, _, err := cb.Do(ctx, "GET", p, nil); err != nil {
+			t.Errorf("%s not put back: %v", p, err)
+		}
+	}
+	data, _, err := cb.Do(ctx, "GET", "/organizations/acme/roles/web", nil)
+	if err != nil || !strings.Contains(string(data), "apache") {
+		t.Errorf("the target's role was not kept: %s %v", data, err)
+	}
+	if !regexp.MustCompile(`already on the target[\s\S]*roles\s+1`).MatchString(out) {
+		t.Errorf("the role is not reported as skipped:\n%s", out)
+	}
+}

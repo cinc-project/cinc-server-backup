@@ -34,6 +34,9 @@ type Options struct {
 	// ExcludeOrgs leaves these out. The users the restored orgs name come
 	// along: members, invitees, group members and ACL entries.
 	Orgs, ExcludeOrgs []string
+	// Merge says what to do with what the target already holds. Empty
+	// (MergeNone) refuses a target holding any org or user being restored.
+	Merge Merge
 }
 
 // Report says what a restore did.
@@ -41,6 +44,9 @@ type Report struct {
 	mu sync.Mutex
 	// Restored counts what was written, by kind.
 	Restored map[string]int
+	// Skipped counts what the target already held and was left as it was
+	// (MergeSkip), by kind.
+	Skipped map[string]int
 	// Warnings lists what was left out, and why.
 	Warnings []format.Warning
 }
@@ -66,7 +72,10 @@ func ToAPI(ctx context.Context, r *format.Reader, c *cinc.Client, opts Options) 
 	if mode == "" {
 		mode = DanglingDrop
 	}
-	rs := &restorer{r: r, c: c, n: n, super: c.ClientName(), rep: &Report{Restored: map[string]int{}}}
+	rs := &restorer{
+		r: r, c: c, n: n, super: c.ClientName(), merge: opts.Merge, track: newTracker(),
+		rep: &Report{Restored: map[string]int{}, Skipped: map[string]int{}},
+	}
 	sel, err := refs.Select(r, opts.Orgs, opts.ExcludeOrgs)
 	if err != nil {
 		return nil, err
@@ -108,6 +117,10 @@ type restorer struct {
 	rep   *Report
 	refs  *refs.Known
 	sel   *refs.Selection
+	merge Merge
+	track *tracker
+	// onTarget lists the orgs and users the target held before this run.
+	onTarget map[string]bool
 }
 
 // each runs fn for every item, at most n at a time, and returns the first
@@ -194,14 +207,16 @@ func (rs *restorer) users() []string {
 	return out
 }
 
-// preflight refuses a target that already has any of the backup's orgs or
-// users: restore creates, and does not merge.
+// preflight records which of the orgs and users being restored the target
+// already has. Without MergeSkip it refuses a target that has any.
 func (rs *restorer) preflight(ctx context.Context, orgs, users []string) error {
 	var clash []string
+	rs.onTarget = map[string]bool{}
 	check := func(p, what string) error {
 		_, _, err := rs.c.Do(cinc.WithServerAPIVersion(ctx, "1"), "GET", p, nil)
 		switch {
 		case err == nil:
+			rs.onTarget[what] = true
 			clash = append(clash, what)
 		case !errors.Is(err, cinc.ErrNotFound):
 			return fmt.Errorf("GET %s: %w", p, err)
@@ -218,8 +233,8 @@ func (rs *restorer) preflight(ctx context.Context, orgs, users []string) error {
 			return err
 		}
 	}
-	if len(clash) > 0 {
-		return fmt.Errorf("the target already has %s; restore needs a server without them", strings.Join(clash, ", "))
+	if len(clash) > 0 && rs.merge != MergeSkip {
+		return fmt.Errorf("the target already has %s; restore needs a server without them, or --merge skip to keep what it has and add the rest", strings.Join(clash, ", "))
 	}
 	return nil
 }
@@ -264,6 +279,10 @@ func (rs *restorer) extraKeys(ctx context.Context, dir, base, kind string) error
 }
 
 func (rs *restorer) user(ctx context.Context, u string) error {
+	if rs.onTarget["user "+u] {
+		rs.rep.skip("users") // its keys and password stay the target's
+		return nil
+	}
 	dir := "server/users/" + u
 	doc, err := rs.object(dir + ".json")
 	if err != nil {
@@ -287,6 +306,7 @@ func (rs *restorer) user(ctx context.Context, u string) error {
 	if _, err := rs.do(ctx, "POST", "/users", body, "1"); err != nil {
 		return err
 	}
+	rs.track.madeUser(u)
 	rs.rep.add("users")
 	return rs.extraKeys(ctx, dir, "/users/"+esc(u), "user")
 }
@@ -296,11 +316,16 @@ func (rs *restorer) org(ctx context.Context, o string) error {
 	if err != nil {
 		return err
 	}
-	body, _ := json.Marshal(map[string]any{"name": o, "full_name": doc["full_name"]})
-	if _, err := rs.do(ctx, "POST", "/organizations", body, "1"); err != nil {
-		return err
+	if rs.onTarget["organization "+o] {
+		rs.rep.skip("orgs")
+	} else {
+		body, _ := json.Marshal(map[string]any{"name": o, "full_name": doc["full_name"]})
+		if _, err := rs.do(ctx, "POST", "/organizations", body, "1"); err != nil {
+			return err
+		}
+		rs.track.madeOrg(o)
+		rs.rep.add("orgs")
 	}
-	rs.rep.add("orgs")
 	base := "/organizations/" + esc(o)
 	if data, err := rs.r.Object("orgs/" + o + "/members.json"); err == nil {
 		var members []struct {
@@ -313,10 +338,11 @@ func (rs *restorer) org(ctx context.Context, o string) error {
 		}
 		for _, m := range members {
 			b, _ := json.Marshal(map[string]string{"username": m.User.Username})
-			if _, err := rs.do(ctx, "POST", base+"/users", b, "1"); err != nil {
+			if ok, err := rs.write(ctx, "members", "POST", base+"/users", b); err != nil {
 				return err
+			} else if ok {
+				rs.rep.add("members")
 			}
-			rs.rep.add("members")
 		}
 	}
 	if data, err := rs.r.Object("orgs/" + o + "/invitations.json"); err == nil {
@@ -328,10 +354,11 @@ func (rs *restorer) org(ctx context.Context, o string) error {
 		}
 		for _, inv := range invites {
 			b, _ := json.Marshal(map[string]string{"user": inv.Username})
-			if _, err := rs.do(ctx, "POST", base+"/association_requests", b, "1"); err != nil {
+			if ok, err := rs.write(ctx, "invitations", "POST", base+"/association_requests", b); err != nil {
 				return err
+			} else if ok {
+				rs.rep.add("invitations")
 			}
-			rs.rep.add("invitations")
 		}
 	}
 	return nil
@@ -383,6 +410,7 @@ func (rs *restorer) containers(ctx context.Context, o string) error {
 		if _, err := rs.do(ctx, "POST", base, b, "1"); err != nil {
 			return err
 		}
+		rs.track.madeObject(o, "containers", n)
 		rs.rep.add("containers")
 		return nil
 	})
@@ -405,6 +433,10 @@ func (rs *restorer) clients(ctx context.Context, o string) error {
 			return err
 		}
 		cbase := base + "/" + esc(name)
+		if have[name] && !rs.track.newOrg(o) {
+			rs.rep.skip("clients") // it and its keys stay the target's
+			return nil
+		}
 		if have[name] {
 			// Created with the org (the validator): put back its key, so
 			// existing validation.pem files keep working.
@@ -426,6 +458,7 @@ func (rs *restorer) clients(ctx context.Context, o string) error {
 			if _, err := rs.do(ctx, "POST", base, b, "1"); err != nil {
 				return err
 			}
+			rs.track.madeObject(o, "clients", name)
 		}
 		rs.rep.add("clients")
 		return rs.extraKeys(ctx, dir, cbase, "client")
@@ -464,8 +497,11 @@ func (rs *restorer) groups(ctx context.Context, o string) error {
 	}
 	if err := rs.each(ctx, missing, func(ctx context.Context, g string) error {
 		b, _ := json.Marshal(map[string]string{"groupname": g})
-		_, err := rs.do(ctx, "POST", base, b, "1")
-		return err
+		if _, err := rs.do(ctx, "POST", base, b, "1"); err != nil {
+			return err
+		}
+		rs.track.madeObject(o, "groups", g)
+		return nil
 	}); err != nil {
 		return err
 	}
@@ -484,9 +520,21 @@ func (rs *restorer) groups(ctx context.Context, o string) error {
 		_ = json.Unmarshal(cur, &target)
 		// Dangling names were reported by resolve.
 		users, clients, groups, _ := rs.refs.Members(o, doc)
-		for _, sub := range stringsOf(target["groups"]) {
-			if usag.MatchString(sub) {
-				groups = append(groups, sub)
+		if !rs.track.created(o, "groups", g) {
+			// The target's group: add the backup's members it lacks.
+			var cu, cc, cg bool
+			users, cu = union(stringsOf(target["users"]), users)
+			clients, cc = union(stringsOf(target["clients"]), clients)
+			groups, cg = union(stringsOf(target["groups"]), groups)
+			if !cu && !cc && !cg {
+				rs.rep.skip("groups")
+				return nil
+			}
+		} else {
+			for _, sub := range stringsOf(target["groups"]) {
+				if usag.MatchString(sub) {
+					groups = append(groups, sub)
+				}
 			}
 		}
 		b, _ := json.Marshal(map[string]any{"groupname": g, "actors": map[string]any{"users": users, "clients": clients, "groups": groups}})
@@ -515,9 +563,10 @@ func (rs *restorer) plainObjects(ctx context.Context, o string) error {
 			if err != nil {
 				return err
 			}
-			if _, err := rs.do(ctx, "POST", base, data, "1"); err != nil {
+			if ok, err := rs.write(ctx, coll, "POST", base, data); err != nil || !ok {
 				return err
 			}
+			rs.track.madeObject(o, coll, n)
 			rs.rep.add(coll)
 			return nil
 		}); err != nil {
@@ -531,19 +580,22 @@ func (rs *restorer) dataBags(ctx context.Context, o string) error {
 	base := "/organizations/" + esc(o) + "/data"
 	return rs.each(ctx, rs.names("orgs/"+o+"/data_bags/"), func(ctx context.Context, bag string) error {
 		b, _ := json.Marshal(map[string]string{"name": bag})
-		if _, err := rs.do(ctx, "POST", base, b, "1"); err != nil {
+		if ok, err := rs.write(ctx, "data_bags", "POST", base, b); err != nil {
 			return err
+		} else if ok {
+			rs.track.madeObject(o, "data", bag)
+			rs.rep.add("data_bags")
 		}
-		rs.rep.add("data_bags")
 		for _, item := range rs.names("orgs/" + o + "/data_bags/" + bag + "/") {
 			data, err := rs.r.Object("orgs/" + o + "/data_bags/" + bag + "/" + item + ".json")
 			if err != nil {
 				return err
 			}
-			if _, err := rs.do(ctx, "POST", base+"/"+esc(bag), data, "1"); err != nil {
+			if ok, err := rs.write(ctx, "data_bag_items", "POST", base+"/"+esc(bag), data); err != nil {
 				return err
+			} else if ok {
+				rs.rep.add("data_bag_items")
 			}
-			rs.rep.add("data_bag_items")
 		}
 		return nil
 	})
@@ -574,7 +626,21 @@ func (rs *restorer) artifacts(ctx context.Context, o string) error {
 // manifest as backed up, frozen state included.
 func (rs *restorer) manifests(ctx context.Context, o, coll, kind string) error {
 	org := "/organizations/" + esc(o)
+	// A PUT would overwrite a version the target has, so look first.
+	have, err := rs.targetVersions(ctx, o, coll)
+	if err != nil {
+		return err
+	}
 	return rs.each(ctx, rs.versions(o, coll), func(ctx context.Context, nv string) error {
+		cb, ver := path.Split(nv)
+		cb = strings.TrimSuffix(cb, "/")
+		if have[cb][ver] {
+			rs.rep.skip(kind)
+			return nil
+		}
+		if _, ok := have[cb]; !ok {
+			rs.track.madeObject(o, coll, cb) // the ACL is per name
+		}
 		p := "orgs/" + o + "/" + coll + "/" + nv + ".json"
 		data, err := rs.r.Object(p)
 		if err != nil {
@@ -676,14 +742,44 @@ func withoutFileURLs(manifest []byte) ([]byte, error) {
 func (rs *restorer) policies(ctx context.Context, o string) error {
 	org := "/organizations/" + esc(o)
 	revs := rs.versions(o, "policies")
+	// What the target already has, so its policies' ACLs and its groups'
+	// assignments are added to rather than replaced.
+	havePolicies, haveGroups := map[string]bool{}, map[string]map[string]bool{}
+	if !rs.track.newOrg(o) {
+		pl, err := rs.listing(ctx, org+"/policies")
+		if err != nil {
+			return err
+		}
+		for n := range pl {
+			havePolicies[n] = true
+		}
+		gl, err := rs.listing(ctx, org+"/policy_groups")
+		if err != nil {
+			return err
+		}
+		for g, raw := range gl {
+			var entry struct {
+				Policies map[string]json.RawMessage `json:"policies"`
+			}
+			_ = json.Unmarshal(raw, &entry)
+			haveGroups[g] = map[string]bool{}
+			for n := range entry.Policies {
+				haveGroups[g][n] = true
+			}
+		}
+	}
 	if err := rs.each(ctx, revs, func(ctx context.Context, pr string) error {
 		data, err := rs.r.Object("orgs/" + o + "/policies/" + pr + ".json")
 		if err != nil {
 			return err
 		}
 		name, _ := path.Split(pr)
-		if _, err := rs.do(ctx, "POST", org+"/policies/"+esc(strings.TrimSuffix(name, "/"))+"/revisions", data, "1"); err != nil {
+		name = strings.TrimSuffix(name, "/")
+		if ok, err := rs.write(ctx, "policy_revisions", "POST", org+"/policies/"+esc(name)+"/revisions", data); err != nil || !ok {
 			return err
+		}
+		if !havePolicies[name] {
+			rs.track.madeObject(o, "policies", name)
 		}
 		rs.rep.add("policy_revisions")
 		return nil
@@ -696,7 +792,16 @@ func (rs *restorer) policies(ctx context.Context, o string) error {
 			return err
 		}
 		pols, _ := doc["policies"].(map[string]any)
+		_, existed := haveGroups[g]
+		if !existed {
+			rs.track.madeObject(o, "policy_groups", g)
+		}
+		wrote := !existed
 		for name, v := range pols {
+			if haveGroups[g][name] {
+				continue // keep the target's assignment
+			}
+			wrote = true
 			ref, _ := v.(map[string]any)
 			rev, _ := ref["revision_id"].(string)
 			data, err := rs.r.Object("orgs/" + o + "/policies/" + name + "/" + rev + ".json")
@@ -707,7 +812,11 @@ func (rs *restorer) policies(ctx context.Context, o string) error {
 				return err
 			}
 		}
-		rs.rep.add("policy_groups")
+		if wrote {
+			rs.rep.add("policy_groups")
+		} else {
+			rs.rep.skip("policy_groups")
+		}
 		return nil
 	})
 }
@@ -716,24 +825,44 @@ var perms = []string{"create", "read", "update", "delete", "grant"}
 
 // putACL writes each permission of the ACL stored at p, for an object of org
 // o ("" for a user's own ACL), to base/_acl/<perm>. Per-user groups and
-// dangling names are left out; resolve has already reported them.
-func (rs *restorer) putACL(ctx context.Context, p, base, o string) error {
+// dangling names are left out; resolve has already reported them. For an
+// object this run created (created), the backup's ACL replaces the target's;
+// for one the target already had, the backup's entries are added to it.
+func (rs *restorer) putACL(ctx context.Context, p, base, o string, created bool) error {
 	acl, err := rs.object(p)
 	if err != nil {
 		return err
 	}
+	var target map[string]map[string]any
+	if !created {
+		if target, err = rs.targetACL(ctx, base); err != nil {
+			return err
+		}
+	}
+	wrote := false
 	for _, perm := range perms {
 		ace, ok := acl[perm].(map[string]any)
 		if !ok {
 			continue
 		}
 		out, _, _ := rs.refs.ACE(o, ace)
+		if !created {
+			var changed bool
+			if out, changed = rs.mergeACE(o, target[perm], out); !changed {
+				continue
+			}
+		}
 		b, _ := json.Marshal(map[string]any{perm: out})
 		if _, err := rs.do(ctx, "PUT", base+"/_acl/"+perm, b, "1"); err != nil {
 			return err
 		}
+		wrote = true
 	}
-	rs.rep.add("acls")
+	if created || wrote {
+		rs.rep.add("acls")
+	} else {
+		rs.rep.skip("acls")
+	}
 	return nil
 }
 
@@ -742,13 +871,14 @@ func (rs *restorer) acls(ctx context.Context, o string) error {
 	prefix := "orgs/" + o + "/acls/"
 	if err := rs.each(ctx, rs.aclPaths(o), func(ctx context.Context, p string) error {
 		typ, file := path.Split(strings.TrimPrefix(p, prefix))
+		typ = strings.TrimSuffix(typ, "/")
 		name := strings.TrimSuffix(file, ".json")
-		return rs.putACL(ctx, p, org+"/"+strings.TrimSuffix(typ, "/")+"/"+esc(name), o)
+		return rs.putACL(ctx, p, org+"/"+typ+"/"+esc(name), o, rs.track.created(o, typ, name))
 	}); err != nil {
 		return err
 	}
 	if _, ok := rs.r.Entry("orgs/" + o + "/acl.json"); ok {
-		return rs.putACL(ctx, "orgs/"+o+"/acl.json", org+"/organizations", o)
+		return rs.putACL(ctx, "orgs/"+o+"/acl.json", org+"/organizations", o, rs.track.newOrg(o))
 	}
 	return nil
 }
@@ -758,5 +888,5 @@ func (rs *restorer) userACL(ctx context.Context, u string) error {
 	if _, ok := rs.r.Entry(p); !ok {
 		return nil
 	}
-	return rs.putACL(ctx, p, "/users/"+esc(u), "")
+	return rs.putACL(ctx, p, "/users/"+esc(u), "", rs.track.newUser(u))
 }
