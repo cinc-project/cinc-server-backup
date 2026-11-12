@@ -95,26 +95,56 @@ func (t *tracker) isStranger(id string) bool {
 }
 
 // sameActor reports whether the target's actor at base (an existing user or
-// client restore is skipping) holds the default public key the backup's actor
-// at dir has. Without a key on either side to compare, it is not the same.
+// client restore is skipping) is the backup's actor at dir: whether it holds
+// exactly the backup's keys, by name and public key, and no others. Public keys
+// are public, so one matching key proves nothing on its own; requiring the
+// whole set means every key the target's actor can sign with is one the
+// backup's actor held. Without any key on either side, it is not the same.
 func (rs *restorer) sameActor(ctx context.Context, base, dir string) (bool, error) {
-	want, err := rs.defaultKey(dir)
-	if err != nil {
-		return false, err
+	want := map[string]string{}
+	for _, name := range rs.names(dir + "/keys/") {
+		k, err := rs.object(dir + "/keys/" + name + ".json")
+		if err != nil {
+			return false, err
+		}
+		pub, _ := k["public_key"].(string)
+		want[name] = squash(pub)
 	}
-	data, err := rs.do(ctx, "GET", base+"/keys/default", nil, "1")
+	data, err := rs.do(ctx, "GET", base+"/keys", nil, "1")
 	if errors.Is(err, cinc.ErrNotFound) {
 		return false, nil
 	} else if err != nil {
 		return false, err
 	}
-	var k struct {
-		PublicKey string `json:"public_key"`
+	var list []struct {
+		Name string `json:"name"`
 	}
-	if err := json.Unmarshal(data, &k); err != nil {
-		return false, fmt.Errorf("decode %s/keys/default: %w", base, err)
+	if err := json.Unmarshal(data, &list); err != nil {
+		return false, fmt.Errorf("decode %s/keys: %w", base, err)
 	}
-	return want != "" && squash(want) == squash(k.PublicKey), nil
+	if len(want) == 0 || len(list) != len(want) {
+		return false, nil
+	}
+	for _, e := range list {
+		pub, ok := want[e.Name]
+		if !ok {
+			return false, nil
+		}
+		data, err := rs.do(ctx, "GET", base+"/keys/"+esc(e.Name), nil, "1")
+		if err != nil {
+			return false, err
+		}
+		var k struct {
+			PublicKey string `json:"public_key"`
+		}
+		if err := json.Unmarshal(data, &k); err != nil {
+			return false, fmt.Errorf("decode %s/keys/%s: %w", base, e.Name, err)
+		}
+		if pub == "" || squash(k.PublicKey) != pub {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // squash drops the whitespace a PEM may be wrapped or indented with.

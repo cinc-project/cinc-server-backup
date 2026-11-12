@@ -388,3 +388,50 @@ func TestCLIMergeSkipWithholdsGrantsFromAStranger(t *testing.T) {
 		t.Errorf("the client alice lost its delete grant: %s", data)
 	}
 }
+
+// Public keys are public: a target user carrying the backup user's public key
+// as its default, plus an extra key of its own to sign with, is still someone
+// else. Only the backup's exact key set counts as the same actor.
+func TestCLIMergeSkipMatchingOneKeyIsNotEnough(t *testing.T) {
+	a := startNG(t, "acme")
+	seed(t, a)
+	seedExtras(t, a)
+	env := cliEnv{t, t.TempDir()}
+	file := filepath.Join(env.dir, "chef.csb")
+	if code, out := env.run("backup", "--server", a.url, "--user", a.admin, "--key", env.key("a", a), "-o", file); code != 0 {
+		t.Fatalf("backup = %d:\n%s", code, out)
+	}
+	ctx := context.Background()
+	data, _, err := a.client(t, "").Do(ctx, "GET", "/users/alice/keys/default", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var k struct {
+		PublicKey string `json:"public_key"`
+	}
+	if err := json.Unmarshal(data, &k); err != nil {
+		t.Fatal(err)
+	}
+
+	b := startNG(t, "unused")
+	cb := b.client(t, "")
+	body, _ := json.Marshal(map[string]string{
+		"username": "alice", "email": "other@example.com", "first_name": "O", "last_name": "A",
+		"display_name": "Other Alice", "password": "sekrit123", "public_key": k.PublicKey,
+	})
+	if _, _, err := cb.Do(ctx, "POST", "/users", body); err != nil {
+		t.Fatal(err)
+	}
+	// Her own key, which she can sign with.
+	if _, _, err := cb.Do(ctx, "POST", "/users/alice/keys", []byte(`{"name":"mine","create_key":true,"expiration_date":"infinity"}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out := env.run("restore", file, "--server", b.url, "--user", b.admin, "--key", env.key("b", b), "--merge", "skip")
+	if code != 1 || !strings.Contains(out, "merge.different_user") {
+		t.Fatalf("restore = %d, want 1 with a different_user warning:\n%s", code, out)
+	}
+	if _, _, err := cb.Do(ctx, "GET", "/organizations/acme/users/alice", nil); err == nil {
+		t.Error("the other alice was made a member of acme")
+	}
+}
