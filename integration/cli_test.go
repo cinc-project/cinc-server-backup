@@ -3,6 +3,7 @@ package integration
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -328,5 +329,62 @@ func TestCLIRestoreMergeSkipRerun(t *testing.T) {
 	}
 	if !regexp.MustCompile(`already on the target[\s\S]*roles\s+1`).MatchString(out) {
 		t.Errorf("the role is not reported as skipped:\n%s", out)
+	}
+}
+
+// A target user who shares a backup user's name but not its key is someone
+// else: --merge skip gives it none of the backup's memberships or grants, says
+// so, and the check reports what is missing.
+func TestCLIMergeSkipWithholdsGrantsFromAStranger(t *testing.T) {
+	a := startNG(t, "acme")
+	seed(t, a)
+	seedExtras(t, a) // the user alice is in devs and web01's update ACL; a client alice is in its delete ACL
+	env := cliEnv{t, t.TempDir()}
+	file := filepath.Join(env.dir, "chef.csb")
+	if code, out := env.run("backup", "--server", a.url, "--user", a.admin, "--key", env.key("a", a), "-o", file); code != 0 {
+		t.Fatalf("backup = %d:\n%s", code, out)
+	}
+
+	b := startNG(t, "unused")
+	ctx := context.Background()
+	cb := b.client(t, "")
+	// A different alice, with her own key.
+	if _, _, err := cb.Do(ctx, "POST", "/users", []byte(`{"username":"alice","email":"other@example.com","first_name":"O","last_name":"A","display_name":"Other Alice","password":"sekrit123","create_key":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	code, out := env.run("restore", file, "--server", b.url, "--user", b.admin, "--key", env.key("b", b), "--merge", "skip")
+	if code != 1 || !strings.Contains(out, "merge.different_user") {
+		t.Fatalf("restore = %d, want 1 with a different_user warning:\n%s", code, out)
+	}
+
+	if _, _, err := cb.Do(ctx, "GET", "/organizations/acme/users/alice", nil); err == nil {
+		t.Error("the other alice was made a member of acme")
+	}
+	data, _, err := cb.Do(ctx, "GET", "/organizations/acme/groups/devs", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), `"alice"`) && regexp.MustCompile(`"users":\[[^\]]*"alice"`).Match(data) {
+		t.Errorf("the other alice was added to devs: %s", data)
+	}
+	data, _, err = cb.Do(ctx, "GET", "/organizations/acme/nodes/web01/_acl?detail=granular", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var acl map[string]struct {
+		Users   []string `json:"users"`
+		Clients []string `json:"clients"`
+	}
+	if err := json.Unmarshal(data, &acl); err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range acl["update"].Users {
+		if u == "alice" {
+			t.Errorf("the other alice was granted update on web01: %s", data)
+		}
+	}
+	// The client alice is the backup's own, created by this run: it keeps its grant.
+	if !strings.Contains(strings.Join(acl["delete"].Clients, ","), "alice") {
+		t.Errorf("the client alice lost its delete grant: %s", data)
 	}
 }

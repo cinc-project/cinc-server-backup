@@ -212,6 +212,7 @@ What happens to each thing the server already has:
 - **Users, organizations, clients, nodes, roles, environments, data bag items, cookbook versions and policy revisions** are left exactly as they are, keys and contents included, even if the backup's copy differs.
 - **Group memberships and permissions** gain the backup's members and entries they don't have yet. Nothing is removed from them, so afterwards they grant what either the server or the backup granted.
 - **Users the server already has** still join the organizations being restored.
+- **A user or client that only shares a name** with one in the backup gets nothing. Chef knows actors by name, so restore checks that the server's actor holds the same key as the backup's. If it doesn't, it's someone else: restore leaves that name out of every membership and permission it writes, warns (`merge.different_user` or `merge.different_client`), and the check at the end lists what's missing.
 
 The report lists what was skipped:
 
