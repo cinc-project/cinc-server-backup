@@ -232,6 +232,7 @@ type restoreFlags struct {
 	dangling          string
 	noVerify          bool
 	orgs, excludeOrgs []string
+	merge             string
 }
 
 func newRestoreCmd() *cobra.Command {
@@ -259,6 +260,15 @@ A server refuses a whole ACL that names one, so by default (--dangling=drop)
 restore leaves those names out and lists each one. --dangling=fail lists
 them and stops before writing anything.
 
+--merge skip restores into a server that already holds some of the backup,
+such as a second organization sharing users with one restored earlier, or a
+rerun after a restore stopped partway. Users, orgs, clients, nodes, roles,
+environments, data bag items, cookbook versions and policy revisions the
+target already has are left exactly as they are, and listed as skipped. Groups
+and permissions the target already has gain the backup's members and entries
+they lack; none are removed. The check at the end then reports anything the
+target holds differently from the backup.
+
 --org restores only the organizations you name, and --exclude-org leaves
 some out. The users those organizations name come along: members, invitees,
 group members, ACL entries, and the users named in those users' own ACLs.
@@ -276,6 +286,9 @@ cinc-server-backup restore chef.csb --server https://new-chef.example.com --key 
 Restore one organization, and the users it names, out of a whole-server backup.
 cinc-server-backup restore chef.csb --server https://new-chef.example.com --key pivotal.pem --org acme
 
+Restore a second organization into a server that already has users it shares.
+cinc-server-backup restore chef.csb --server https://new-chef.example.com --key pivotal.pem --org beta --merge skip
+
 Stop instead if any ACL or group names a user, client or group the backup lacks.
 cinc-server-backup restore chef.csb --server https://new-chef.example.com --key pivotal.pem --dangling fail`,
 		Args: exactlyOneBackup,
@@ -289,12 +302,17 @@ cinc-server-backup restore chef.csb --server https://new-chef.example.com --key 
 	fl.StringArrayVar(&f.blobHosts, "blob-host", nil, "extra host[:port] file uploads may be redirected to, such as an S3 bookshelf (repeatable)")
 	fl.StringVar(&f.dangling, "dangling", string(restore.DanglingDrop), "what to do with ACL entries and group members the backup can't resolve: drop or fail")
 	fl.BoolVar(&f.noVerify, "no-verify", false, "don't back the target up and compare it with the backup afterwards")
+	fl.StringVar(&f.merge, "merge", "", "restore into a server that already holds some of the backup: skip keeps what it has and adds what's missing")
 	orgFlags(fl, &f.orgs, &f.excludeOrgs)
 	return cmd
 }
 
 func runRestore(cmd *cobra.Command, file string, f restoreFlags) error {
 	dangling, err := restore.ParseDangling(f.dangling)
+	if err != nil {
+		return usagef("%v", err)
+	}
+	merge, err := restore.ParseMerge(f.merge)
 	if err != nil {
 		return usagef("%v", err)
 	}
@@ -327,7 +345,7 @@ func runRestore(cmd *cobra.Command, file string, f restoreFlags) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
 	defer stop()
 	rep, err := restore.ToAPI(ctx, r, c, restore.Options{
-		Concurrency: f.concurrency, Dangling: dangling, Orgs: sel.Orgs,
+		Concurrency: f.concurrency, Dangling: dangling, Orgs: sel.Orgs, Merge: merge,
 	})
 	if rep != nil {
 		printReport(out, rep)
@@ -352,6 +370,17 @@ func printReport(out io.Writer, rep *restore.Report) {
 	fmt.Fprintln(tw, "restored")
 	for _, k := range keys {
 		fmt.Fprintf(tw, "  %s\t%d\n", k, rep.Restored[k])
+	}
+	if len(rep.Skipped) > 0 {
+		fmt.Fprintln(tw, "\nalready on the target, left as it was")
+		skipped := make([]string, 0, len(rep.Skipped))
+		for k := range rep.Skipped {
+			skipped = append(skipped, k)
+		}
+		sort.Strings(skipped)
+		for _, k := range skipped {
+			fmt.Fprintf(tw, "  %s\t%d\n", k, rep.Skipped[k])
+		}
 	}
 	if len(rep.Warnings) > 0 {
 		fmt.Fprintf(tw, "\nleft out (%d)\n", len(rep.Warnings))

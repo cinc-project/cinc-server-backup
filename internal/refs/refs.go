@@ -172,3 +172,7 @@ func Scope(p string) (o string, acl, group, ok bool) {
 	}
 	return "", false, false, false
 }
+
+// IsUser reports whether the backup (or the extra users FromBackup was given)
+// holds a user of this name.
+func (k *Known) IsUser(n string) bool { return k.users[n] }

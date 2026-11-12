@@ -11,7 +11,7 @@ It replaces knife-ec-backup. You'll want it when you need to:
 - **pull one organization out** of a server, into a server of its own;
 - **check a server against a backup** to see whether anything is missing or has changed.
 
-> **Status:** everything below works today over the server's API. Still to come: carrying user passwords and server-admins across (they need access to the server's database), restoring into a server that already has data, and resuming an interrupted restore. See [What isn't carried over yet](#what-isnt-carried-over-yet).
+> **Status:** everything below works today over the server's API. Still to come: carrying user passwords and server-admins across (they need access to the server's database), making a server match a backup by overwriting or deleting what it holds, and previewing a restore. See [What isn't carried over yet](#what-isnt-carried-over-yet).
 
 ## Contents
 
@@ -20,6 +20,7 @@ It replaces knife-ec-backup. You'll want it when you need to:
 - [Back up a server](#back-up-a-server)
 - [Move to a new server](#move-to-a-new-server)
 - [Restore one organization](#restore-one-organization)
+- [Restore into a server that already has data](#restore-into-a-server-that-already-has-data)
 - [Check a server against a backup](#check-a-server-against-a-backup)
 - [See what changed between two backups](#see-what-changed-between-two-backups)
 - [When a backup names someone who no longer exists](#when-a-backup-names-someone-who-no-longer-exists)
@@ -191,7 +192,36 @@ Users who belong only to other organizations are left behind.
 
 `--org a,b` takes several orgs. `--exclude-org` works the other way round: restore everything except the orgs you name. The check at the end compares only what you restored, so the orgs you left out aren't reported as missing.
 
-The new server may already have other organizations. It just mustn't already have the org you're restoring or any of its users. Because of that, restoring a second org that shares a user with one you restored earlier is refused for now. Merging into existing data is on the way.
+The new server may already have other organizations. If it already has the org you're restoring or any of its users, for example a user shared with an org you restored earlier, add `--merge skip` (next section).
+
+## Restore into a server that already has data
+
+By default restore refuses a server that already has any of the organizations or users it's about to create, so it never changes something that's already there. `--merge skip` lifts that: it **keeps what the server has and adds what's missing**.
+
+```sh
+cinc-server-backup restore chef.csb --server https://new-chef.example.com --key pivotal.pem --org beta --merge skip
+```
+
+Use it to:
+
+- **restore a second organization** that shares users with one you restored earlier;
+- **finish a restore that stopped partway**: run the same command again with `--merge skip`, and it adds only what didn't make it the first time.
+
+What happens to each thing the server already has:
+
+- **Users, organizations, clients, nodes, roles, environments, data bag items, cookbook versions and policy revisions** are left exactly as they are, keys and contents included, even if the backup's copy differs.
+- **Group memberships and permissions** gain the backup's members and entries they don't have yet. Nothing is removed from them, so afterwards they grant what either the server or the backup granted.
+- **Users the server already has** still join the organizations being restored.
+
+The report lists what was skipped:
+
+```
+already on the target, left as it was
+  roles   1
+  users   1
+```
+
+The check at the end still compares everything against the backup. So if the server holds something differently from the backup, such as a role someone edited, it shows up under differences and the run exits 1. That's how you find out what `--merge skip` didn't change.
 
 ## Check a server against a backup
 
@@ -282,8 +312,7 @@ These need access to the server's database, not just its API, and are planned ne
 
 Also planned:
 
-- **Restoring into a server that already has data.** Today the target must not have any of the organizations or users being restored.
-- **Resuming an interrupted restore.** For now, if a restore stops partway, start again with an empty server.
+- **Making a server match a backup** by overwriting objects it holds differently (`--merge overwrite`) and deleting ones the backup doesn't have (`--prune`). `--merge skip` only adds.
 - **Previewing a restore** before it writes anything.
 
 ## Keeping backups safe
