@@ -127,12 +127,11 @@ func TestSuperuserIsComparedUnlessSkipped(t *testing.T) {
 	}
 }
 
-// A cookbook without "frozen?" is not frozen (erchef's default), and a
-// policy group's uri is a URL the target regenerates, its name the path's.
-func TestDefaultsAndDerivedFieldsAreSetAside(t *testing.T) {
+// A policy group's uri is a URL on the server it was read from.
+func TestPolicyGroupURIIsSetAsideButFrozenIsNot(t *testing.T) {
 	a := build(t, map[string]string{
-		"orgs/acme/cookbooks/nginx/1.0.0.json": `{"name":"nginx-1.0.0","all_files":[]}`,
-		"orgs/acme/policy_groups/prod.json":    `{"name":"prod","uri":"","policies":{"web":{"revision_id":"1"}}}`,
+		"orgs/acme/cookbooks/nginx/1.0.0.json": `{"name":"nginx-1.0.0","all_files":[],"frozen?":false}`,
+		"orgs/acme/policy_groups/prod.json":    `{"policies":{"web":{"revision_id":"1"}},"uri":"http://old/organizations/acme/policy_groups/prod"}`,
 	})
 	b := build(t, map[string]string{
 		"orgs/acme/cookbooks/nginx/1.0.0.json": `{"name":"nginx-1.0.0","all_files":[],"frozen?":false}`,
@@ -142,13 +141,20 @@ func TestDefaultsAndDerivedFieldsAreSetAside(t *testing.T) {
 		t.Fatalf("diffs = %+v, %v", diffs, err)
 	}
 	// A frozen cookbook restored unfrozen, or a group pointing elsewhere, is
-	// still a difference.
+	// a difference; so is a missing "frozen?", which erchef always sends.
 	c := build(t, map[string]string{
 		"orgs/acme/cookbooks/nginx/1.0.0.json": `{"name":"nginx-1.0.0","all_files":[],"frozen?":true}`,
 		"orgs/acme/policy_groups/prod.json":    `{"uri":"x","policies":{"web":{"revision_id":"2"}}}`,
 	})
 	if diffs, _ := Backups(a, c, Options{}); len(diffs) != 2 {
 		t.Fatalf("diffs = %+v, want the frozen flag and the revision", diffs)
+	}
+	d := build(t, map[string]string{
+		"orgs/acme/cookbooks/nginx/1.0.0.json": `{"name":"nginx-1.0.0","all_files":[]}`,
+		"orgs/acme/policy_groups/prod.json":    `{"uri":"y","policies":{"web":{"revision_id":"1"}}}`,
+	})
+	if diffs, _ := Backups(a, d, Options{}); len(diffs) != 1 || diffs[0].Path != "orgs/acme/cookbooks/nginx/1.0.0.json" {
+		t.Fatalf("diffs = %+v, want the cookbook missing frozen?", diffs)
 	}
 }
 
