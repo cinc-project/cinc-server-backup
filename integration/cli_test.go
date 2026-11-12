@@ -73,7 +73,7 @@ func TestCLIRestoreIntoEmptyServer(t *testing.T) {
 	}
 }
 
-// verify --server after a restore: exit 0 when the target holds everything,
+// restore, and verify --server after it: exit 0 when the target holds everything,
 // 3 when it holds everything but the dangling names restore left out, and 1
 // once it drifts.
 func TestCLIVerifyServerFidelity(t *testing.T) {
@@ -99,10 +99,12 @@ func TestCLIVerifyServerFidelity(t *testing.T) {
 	}
 	b := startNG(t, "unused")
 	keyB := keyOf("b", b)
-	if code, out := run("restore", file, "--server", b.url, "--user", b.admin, "--key", keyB); code != 0 {
-		t.Fatalf("restore = %d:\n%s", code, out)
+	// Restore checks its own result: exit 3, everything but the dropped names.
+	code, out := run("restore", file, "--server", b.url, "--user", b.admin, "--key", keyB)
+	if code != 3 || !regexp.MustCompile(`fidelity:[\s\S]*dropped\s+3\s[\s\S]*differences\s+0`).MatchString(out) {
+		t.Fatalf("restore = %d, want 3 with a fidelity report dropping 3 names:\n%s", code, out)
 	}
-	code, out := run("verify", file, "--server", b.url, "--user", b.admin, "--key", keyB)
+	code, out = run("verify", file, "--server", b.url, "--user", b.admin, "--key", keyB)
 	if code != 3 {
 		t.Fatalf("verify = %d, want 3:\n%s", code, out)
 	}
@@ -131,10 +133,30 @@ func TestCLIVerifyServerFidelity(t *testing.T) {
 	}
 	c := startNG(t, "unused")
 	keyC := keyOf("c", c)
-	if code, out := run("restore", clean, "--server", c.url, "--user", c.admin, "--key", keyC); code != 0 {
-		t.Fatalf("restore = %d:\n%s", code, out)
+	if code, out := run("restore", clean, "--server", c.url, "--user", c.admin, "--key", keyC); code != 0 ||
+		!regexp.MustCompile(`fidelity:[\s\S]*differences\s+0`).MatchString(out) {
+		t.Fatalf("restore = %d, want 0 with a fidelity report:\n%s", code, out)
 	}
 	if code, out := run("verify", clean, "--server", c.url, "--user", c.admin, "--key", keyC); code != 0 || !regexp.MustCompile(`dropped\s+0\s`).MatchString(out) {
 		t.Fatalf("verify of a clean restore = %d, want 0:\n%s", code, out)
+	}
+}
+
+// --no-verify leaves out the check after a restore, and with it exit 3.
+func TestCLIRestoreNoVerify(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "dangling.csb")
+	if err := os.WriteFile(file, danglingBytes(t), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b := startNG(t, "unused")
+	key := filepath.Join(dir, "b.pem")
+	if err := os.WriteFile(key, b.key, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var o, e bytes.Buffer
+	code := cli.Run([]string{"restore", file, "--server", b.url, "--user", b.admin, "--key", key, "--no-verify"}, &o, &e)
+	if code != 0 || strings.Contains(o.String(), "fidelity") {
+		t.Fatalf("restore --no-verify = %d, want 0 and no fidelity report:\n%s%s", code, o.String(), e.String())
 	}
 }

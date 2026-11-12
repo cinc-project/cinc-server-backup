@@ -36,7 +36,8 @@ func usagef(format string, a ...any) error { return usageError{fmt.Errorf(format
 
 // Run executes the command line args (without the program name) and returns
 // the process exit code: 0 success, 1 failure, 2 usage error, 3 when verify
-// finds a server holding everything but the dangling names it reports.
+// or restore finds a server holding everything but the dangling names it
+// reports.
 func Run(args []string, stdout, stderr io.Writer) int {
 	root := newRootCmd()
 	root.SetArgs(args)
@@ -227,6 +228,7 @@ type restoreFlags struct {
 	concurrency       int
 	blobHosts         []string
 	dangling          string
+	noVerify          bool
 }
 
 func newRestoreCmd() *cobra.Command {
@@ -252,7 +254,15 @@ An ACL entry or group member can name a user, client or group the backup
 doesn't hold, such as a user deleted after being granted access to a node.
 A server refuses a whole ACL that names one, so by default (--dangling=drop)
 restore leaves those names out and lists each one. --dangling=fail lists
-them and stops before writing anything.`,
+them and stops before writing anything.
+
+Once everything is written, restore checks the result as verify --server
+does: it backs the target up into a temporary file, compares it with the
+backup and prints the fidelity report. --no-verify skips that.
+
+Restore exits 0 when the target holds everything in the backup, 3 when it
+holds everything but the dangling names it left out, and 1 on any failure
+or difference.`,
 		Example: `Restore a backup into a new, empty server.
 cinc-server-backup restore chef.csb --server https://new-chef.example.com --key pivotal.pem
 
@@ -268,6 +278,7 @@ cinc-server-backup restore chef.csb --server https://new-chef.example.com --key 
 	fl.IntVar(&f.concurrency, "concurrency", 8, "most requests to have in flight at once")
 	fl.StringArrayVar(&f.blobHosts, "blob-host", nil, "extra host[:port] file uploads may be redirected to, such as an S3 bookshelf (repeatable)")
 	fl.StringVar(&f.dangling, "dangling", string(restore.DanglingDrop), "what to do with ACL entries and group members the backup can't resolve: drop or fail")
+	fl.BoolVar(&f.noVerify, "no-verify", false, "don't back the target up and compare it with the backup afterwards")
 	return cmd
 }
 
@@ -300,10 +311,18 @@ func runRestore(cmd *cobra.Command, file string, f restoreFlags) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
 	defer stop()
 	rep, err := restore.ToAPI(ctx, r, c, restore.Options{Concurrency: f.concurrency, Dangling: dangling})
+	out := cmd.OutOrStdout()
 	if rep != nil {
-		printReport(cmd.OutOrStdout(), rep)
+		printReport(out, rep)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	if f.noVerify {
+		return nil
+	}
+	fmt.Fprintln(out)
+	return checkServer(ctx, out, r, file, f.server, f.user, c, capture.Options{Concurrency: f.concurrency, BlobHosts: f.blobHosts})
 }
 
 func printReport(out io.Writer, rep *restore.Report) {
@@ -479,13 +498,22 @@ func runVerify(cmd *cobra.Command, file string, f verifyFlags) error {
 	}
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
 	defer stop()
+	return checkServer(ctx, out, r, file, f.server, f.user, c, opts)
+}
+
+// checkServer backs up the server c talks to into a temporary file (0600,
+// removed afterwards), compares it with the backup r read from file, leaving
+// out the superuser c signs as, and prints the fidelity report. It returns
+// errDifferent if anything differs, errDropped if only dangling names are
+// missing, and nil if the server holds everything.
+func checkServer(ctx context.Context, out io.Writer, r *format.Reader, file, server, user string, c *cinc.Client, opts capture.Options) error {
 	tmp, err := os.CreateTemp("", "csb-verify-*.csb") // created 0600
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tmp.Close(); _ = os.Remove(tmp.Name()) }()
-	fmt.Fprintf(out, "backing up %s to compare\n", f.server)
-	w := format.NewWriter(tmp, format.Source{URL: f.server})
+	fmt.Fprintf(out, "backing up %s to compare\n", server)
+	w := format.NewWriter(tmp, format.Source{URL: server})
 	w.SetTool(progName + " " + Version)
 	if err := capture.FromAPI(ctx, c, w, opts); err != nil {
 		return err
@@ -501,11 +529,11 @@ func runVerify(cmd *cobra.Command, file string, f verifyFlags) error {
 	if err != nil {
 		return err
 	}
-	res, err := compare.Compare(r, live, compare.Options{SkipUsers: []string{f.user}})
+	res, err := compare.Compare(r, live, compare.Options{SkipUsers: []string{user}})
 	if err != nil {
 		return err
 	}
-	printFidelity(out, file, f.server, res)
+	printFidelity(out, file, server, res)
 	switch {
 	case len(res.Differences) > 0:
 		return errDifferent
