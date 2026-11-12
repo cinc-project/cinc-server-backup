@@ -143,6 +143,8 @@ func normalize(t *testing.T, path string, data []byte) any {
 			delete(f.(map[string]any), "url")
 		}
 		sortBy(m["all_files"], "path")
+	case strings.Contains(path, "/policy_groups/"):
+		delete(m, "uri") // the group's URL on whichever server
 	case strings.Contains(path, "/groups/"):
 		m["groups"] = dropUSAGs(m["groups"])
 		delete(m, "actors")

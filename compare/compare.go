@@ -67,9 +67,9 @@ type Result struct {
 // Backups reports every object or file in a that is missing from b or differs
 // from b's copy once regenerated values are set aside: org GUIDs, file URLs
 // and their order, the URLs in listings, per-user group names, a policy
-// group's uri and name, a cookbook's missing "frozen?" (erchef's default,
-// false), and the order of members, actors and groups. Objects only in b are not reported, so a
-// target may hold more than the backup restored into it.
+// group's uri, and the order of members, actors and groups. Objects only in
+// b are not reported, so a target may hold more than the backup restored
+// into it.
 //
 // Names in a's ACLs and groups that a does not hold are dangling. When b
 // lacks them, as it does after a restore left them out, the object still
@@ -255,13 +255,9 @@ func normalize(p string, data []byte) (any, error) {
 			}
 			sort.Slice(files, func(i, j int) bool { return fileKey(files[i]) < fileKey(files[j]) })
 		}
-		if _, ok := m["frozen?"]; !ok {
-			m["frozen?"] = false // erchef's default
-		}
 	case len(segs) == 4 && segs[2] == "policy_groups":
-		// uri is the group's URL on whichever server; the name is the path's.
+		// uri is the group's URL on whichever server.
 		delete(m, "uri")
-		delete(m, "name")
 	case len(segs) == 4 && segs[2] == "groups":
 		m["groups"] = dropUSAGs(m["groups"])
 		delete(m, "actors") // derived from users and clients
