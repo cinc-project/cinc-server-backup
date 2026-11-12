@@ -18,6 +18,7 @@ import (
 const (
 	Missing = "missing" // in the first backup, not the second
 	Changed = "changed" // in both, with different contents
+	Extra   = "extra"   // in the second backup, not the first (Options.Extras)
 )
 
 // Difference is one way the second backup falls short of the first.
@@ -36,6 +37,10 @@ type Options struct {
 	// Include, when set, limits the comparison to the paths of a it
 	// accepts, such as the orgs a partial restore wrote.
 	Include func(path string) bool
+	// Extras also reports objects only b holds (within Include), such as
+	// what a prune should have deleted. Cookbook files are left out: b holds
+	// exactly those its manifests use, so an extra manifest already shows.
+	Extras bool
 }
 
 // usag matches the per-user groups a server names after a user's internal
@@ -162,6 +167,17 @@ func Compare(a, b *format.Reader, opts Options) (*Result, error) {
 			}
 		}
 		res.Differences = append(res.Differences, Difference{Path: p, Kind: Changed, Before: string(da), After: string(db)})
+	}
+	if opts.Extras {
+		for _, e := range b.Manifest().Entries {
+			p := e.Path
+			if strings.HasPrefix(p, "blobs/") || (opts.Include != nil && !opts.Include(p)) || skipped(p, skip) {
+				continue
+			}
+			if _, ok := a.Entry(p); !ok {
+				res.Differences = append(res.Differences, Difference{Path: p, Kind: Extra})
+			}
+		}
 	}
 	return res, nil
 }

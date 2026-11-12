@@ -322,7 +322,7 @@ func TestRestoreRefusesNonEmptyTarget(t *testing.T) {
 }
 
 // editBytes returns a copy of r, as a backup file's bytes, with fn applied
-// to every object's bytes.
+// to every object's bytes. An object fn returns nil for is left out.
 func editBytes(t *testing.T, r *format.Reader, fn func(path string, data []byte) []byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
@@ -349,8 +349,12 @@ func editBytes(t *testing.T, r *format.Reader, fn func(path string, data []byte)
 		if err != nil {
 			t.Fatal(err)
 		}
+		data = fn(e.Path, data)
+		if data == nil {
+			continue // fn dropped it
+		}
 		meta := format.Meta{Source: e.Source, APIVersion: e.APIVersion, FetchedAt: e.FetchedAt}
-		if err := w.PutObject(e.Path, fn(e.Path, data), meta); err != nil {
+		if err := w.PutObject(e.Path, data, meta); err != nil {
 			t.Fatal(err)
 		}
 	}
