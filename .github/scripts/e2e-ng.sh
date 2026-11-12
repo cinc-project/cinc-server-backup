@@ -3,9 +3,18 @@
 #
 # Starts a source server loaded with a fixture (--state), backs it up, verifies
 # the backup, restores it into a fresh server, backs that up, and diffs the two
-# backups. Exits non-zero on the first failure, including any difference.
+# backups.
 #
-# Usage: scripts/e2e-ng.sh <fixture-dir>
+# Then the dangling-reference cycle: a copy of the backup is made to name a
+# user and a client it doesn't hold (as an erchef backup does after someone
+# was deleted; ng removes the names, so its backups never have them). Restore
+# into another fresh server must refuse it with --dangling fail and write
+# nothing, then with the default (drop) report exactly the injected names and
+# produce the same server as the clean backup.
+#
+# Exits non-zero on the first failure, including any difference.
+#
+# Usage: .github/scripts/e2e-ng.sh <fixture-dir>
 #   NG_IMAGE  container image to run, e.g. ghcr.io/cinc-project/cinc-server-ng:0.20.0
 #   NG_BIN    or: path to a cinc-server-ng binary (used when NG_IMAGE is unset)
 #   WORKDIR   where keys, logs and backups go (default: a new temp dir)
@@ -16,6 +25,7 @@ work=${WORKDIR:-$(mktemp -d)}
 mkdir -p "$work/keys"
 src_port=18889
 dst_port=18890
+dangle_port=18891
 pids=()
 containers=()
 
@@ -51,9 +61,10 @@ start() {
   return 1
 }
 
-repo=$(cd "$(dirname "$0")/.." && pwd)
+repo=$(cd "$(dirname "$0")/../.." && pwd)
 csb="$work/cinc-server-backup"
 (cd "$repo" && go build -o "$csb" ./cmd/cinc-server-backup)
+(cd "$repo/integration" && go build -o "$work/dangle" ./cmd/dangle)
 
 echo "== starting the source (loaded from $fixture) and an empty target"
 start src "$src_port" --state @FIXTURE@
@@ -70,3 +81,29 @@ echo "== restoring into the target"
 echo "== backing up the target and comparing"
 "$csb" backup --server "http://127.0.0.1:$dst_port" --key "$work/keys/dst.pem" -o "$work/target.csb"
 "$csb" diff "$work/source.csb" "$work/target.csb"
+
+echo "== dangling references: making a copy of the backup name a deleted user and client"
+"$work/dangle" "$work/source.csb" "$work/dangling.csb" | sort >"$work/dangling.want"
+cat "$work/dangling.want"
+"$csb" verify "$work/dangling.csb"
+start dangle "$dangle_port" --orgs unused
+
+echo "== --dangling fail must refuse it and write nothing"
+if "$csb" restore "$work/dangling.csb" --server "http://127.0.0.1:$dangle_port" --key "$work/keys/dangle.pem" \
+  --dangling fail >"$work/fail.out" 2>&1; then
+  cat "$work/fail.out"
+  echo "restore --dangling fail succeeded; want a refusal" >&2
+  exit 1
+fi
+cat "$work/fail.out"
+grep -q "nothing was restored" "$work/fail.out"
+
+echo "== the default (drop) must leave out exactly the injected names"
+"$csb" restore "$work/dangling.csb" --server "http://127.0.0.1:$dangle_port" --key "$work/keys/dangle.pem" \
+  | tee "$work/drop.out"
+awk '/dangling_dropped/ {print $1, $2, $3, $4, $5}' "$work/drop.out" | sed 's/ *$//' | sort >"$work/dangling.got"
+diff -u "$work/dangling.want" "$work/dangling.got"
+
+echo "== the result must match the clean backup"
+"$csb" backup --server "http://127.0.0.1:$dangle_port" --key "$work/keys/dangle.pem" -o "$work/dangle-target.csb"
+"$csb" diff "$work/source.csb" "$work/dangle-target.csb"

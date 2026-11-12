@@ -31,7 +31,7 @@ cd integration && go test -race ./...
 golangci-lint run ./... && (cd integration && golangci-lint run ./...)
 ```
 
-`scripts/e2e-ng.sh <fixture>` runs the whole cycle against a real cinc-server-ng: it starts a server loaded from the fixture and an empty one (the container image with `NG_IMAGE`, or a binary with `NG_BIN`), backs up, verifies, restores, backs up the target and diffs. CI runs it with the released image and cinc-server-ng's `dev/test-repo`.
+`.github/scripts/e2e-ng.sh <fixture>` runs the whole cycle against a real cinc-server-ng: it starts a server loaded from the fixture and an empty one (the container image with `NG_IMAGE`, or a binary with `NG_BIN`), backs up, verifies, restores, backs up the target and diffs. It then gives a copy of the backup a deleted user and client in an ACL and a group, as an erchef backup can have, and checks that `--dangling fail` writes nothing and the default leaves out exactly those names. CI runs it with the released image and cinc-server-ng's `dev/test-repo`.
 
 ## License
 

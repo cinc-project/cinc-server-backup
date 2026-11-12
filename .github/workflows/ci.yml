@@ -73,6 +73,6 @@ jobs:
           ref: ${{ steps.ng.outputs.tag }}
           path: ng
           sparse-checkout: dev/test-repo
-      - run: scripts/e2e-ng.sh ng/dev/test-repo
+      - run: .github/scripts/e2e-ng.sh ng/dev/test-repo
         env:
           NG_IMAGE: ${{ steps.ng.outputs.image }}
