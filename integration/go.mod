@@ -3,12 +3,12 @@
 // format/, which would otherwise make the two modules depend on each other).
 module github.com/cinc-project/cinc-server-backup/integration
 
-go 1.27.1
+go 1.27.4
 
 require (
 	github.com/cinc-project/cinc-api v0.19.0
 	github.com/cinc-project/cinc-server-backup v0.0.0
-	github.com/cinc-project/cinc-server-ng v0.20.2
+	github.com/cinc-project/cinc-server-ng v0.21.1
 )
 
 require (
@@ -21,10 +21,10 @@ require (
 	github.com/spf13/cobra v1.10.2 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	golang.org/x/sys v0.49.0 // indirect
-	modernc.org/libc v1.79.0 // indirect
+	modernc.org/libc v1.80.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
-	modernc.org/sqlite v1.61.1 // indirect
+	modernc.org/sqlite v1.62.0 // indirect
 )
 
 replace github.com/cinc-project/cinc-server-backup => ../
